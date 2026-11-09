@@ -1,0 +1,17 @@
+services:
+  zcode2api:
+    build: .
+    container_name: zcode2api
+    restart: unless-stopped
+    ports:
+      - "3101:3101"
+    env_file:
+      - .env
+    environment:
+      HOST: 0.0.0.0
+      PORT: 3101
+    volumes:
+      - ./data:/app/data
+      # Optional seed files — uncomment if dùng:
+      # - ./tokens.txt:/app/tokens.txt:ro
+      # - ./proxy.txt:/app/proxy.txt:ro
