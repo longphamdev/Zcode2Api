@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -471,9 +472,18 @@ func anthEventToOA(ev string, data map[string]any, id, model string, st *oaStrea
 		case "thinking_delta":
 			delta["reasoning_content"] = upstream.Str(d["thinking"])
 		case "input_json_delta":
-			idx, ok := st.toolIdx[upstream.AsInt(data["index"])]
+			// A delta whose content_block_start went missing (a dropped or
+			// truncated SSE line) must not silently discard the arguments: the
+			// tool call was already announced with `arguments: ""`, so dropping
+			// the payload leaves the client parsing an empty string. Fall back to
+			// the block index itself, then allocate a slot for it so any further
+			// deltas for the same block agree.
+			upIdx := upstream.AsInt(data["index"])
+			idx, ok := st.toolIdx[upIdx]
 			if !ok {
-				return nil
+				idx = len(st.toolIdx)
+				st.toolIdx[upIdx] = idx
+				log.Printf("[openai] tool delta for unseen content block %d — allocating tool index %d", upIdx, idx)
 			}
 			delta["tool_calls"] = []any{map[string]any{
 				"index": idx, "function": map[string]any{"arguments": upstream.Str(d["partial_json"])},
