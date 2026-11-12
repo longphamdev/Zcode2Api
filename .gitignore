@@ -23,7 +23,6 @@ tests/
 # Local workflow and planning
 .zcode/
 .kiro/
-AGENTS.md
 PROJECT_MAP.md
 
 # Node modules
