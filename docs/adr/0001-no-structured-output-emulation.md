@@ -19,9 +19,11 @@ and it only works when the model cooperates, which is not a guarantee. We also
 rejected silently forwarding the field, which changes nothing about the response
 while leaving the client believing it was honoured.
 
-A client asking for structured output therefore gets no guarantee. See
-`docs/deviations.md` for what happens to `response_format` on the wire today, and
-issue #13 for the strict-mode case.
+A client asking for structured output therefore gets no guarantee. A request
+that sets `response_format.json_schema.strict` to `true` is refused outright
+rather than answered with prose — the client was contracting for conformance, so
+it gets an error instead of a silent substitution. Everything less explicit is
+served with the field dropped and a warning logged. See `docs/deviations.md`.
 
 Revisit when the Origin starts enforcing the schema — checkable with the same
 control test — or when the gateway gains a trustworthy enforcement mechanism:

@@ -33,7 +33,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		// conformance we cannot provide. Refuse now rather than return prose it
 		// will fail to parse with no clue why. See docs/adr/0001.
 		writeOpenAIError(w, http.StatusBadRequest,
-			"response_format json_schema with strict:true is not supported by this gateway: "+
+			"response_format.json_schema.strict is not supported by this gateway: "+
 				"the origin does not enforce JSON schemas, so the schema would be silently ignored")
 		return
 	case rfDropped:
@@ -72,31 +72,44 @@ const (
 // must keep working. Anything we cannot parse is treated as non-strict: a
 // malformed field we were going to drop anyway is not worth rejecting over.
 func ClassifyResponseFormat(raw []byte) responseFormatKind {
-	var req struct {
-		ResponseFormat *struct {
-			Type       string `json:"type"`
-			JSONSchema *struct {
-				Strict *bool `json:"strict"`
-			} `json:"json_schema"`
-		} `json:"response_format"`
+	// Two passes. The outer one only asks "is response_format there at all", so
+	// a nested shape we cannot read still counts as a request that asked for
+	// something. The inner one reads the fields, and anything it cannot parse
+	// falls through to dropped — never to silence.
+	var outer struct {
+		ResponseFormat json.RawMessage `json:"response_format"`
 	}
-	if json.Unmarshal(raw, &req) != nil || req.ResponseFormat == nil {
+	if json.Unmarshal(raw, &outer) != nil {
+		// The body does not parse at all; the conversion rejects it a moment
+		// from now, so there is nothing to warn about here.
 		return rfNone
 	}
-	switch req.ResponseFormat.Type {
-	case "json_object":
-		return rfDropped
-	case "json_schema":
-		if req.ResponseFormat.JSONSchema != nil &&
-			req.ResponseFormat.JSONSchema.Strict != nil &&
-			*req.ResponseFormat.JSONSchema.Strict {
-			return rfUnsupported
-		}
-		return rfDropped
-	default:
-		// "text", or a type we do not know: leave the request alone.
+	if len(outer.ResponseFormat) == 0 || string(outer.ResponseFormat) == "null" {
 		return rfNone
 	}
+
+	var rf struct {
+		Type       string `json:"type"`
+		JSONSchema *struct {
+			Strict *bool `json:"strict"`
+		} `json:"json_schema"`
+	}
+	if json.Unmarshal(outer.ResponseFormat, &rf) != nil {
+		return rfDropped
+	}
+	if rf.Type == "text" {
+		return rfNone
+	}
+	if rf.Type == "json_schema" && rf.JSONSchema != nil &&
+		rf.JSONSchema.Strict != nil && *rf.JSONSchema.Strict {
+		return rfUnsupported
+	}
+	// Everything else carries a response_format we are going to discard —
+	// json_object, json_schema, a type we do not recognise, or a shape that did
+	// not parse far enough to tell. Warn either way: the client asked for
+	// something and is not getting it, and staying quiet is the failure mode
+	// this whole path exists to prevent.
+	return rfDropped
 }
 
 func OpenAIToAnthropic(raw []byte) ([]byte, error) {

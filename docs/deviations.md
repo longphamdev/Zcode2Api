@@ -19,13 +19,19 @@ tightening it later breaks them. The async path (`/async/v1/messages`) bypasses
 the default altogether, so any change here has to align both paths in the same
 commit or they will disagree about what a model-less request means.
 
-## `response_format` is accepted and dropped
+## `response_format` is accepted and dropped — unless it is strict
 
-Requests carrying `json_object`, or `json_schema` without `strict: true`,
-succeed with the field discarded. The model may still return JSON if its prompt
-suggests it, but no schema constrains it. `strict: true` is the case where a
-client explicitly contracts for a guarantee and is handled separately — see
-issue #13.
+Requests carrying `json_object`, or `json_schema` without
+`response_format.json_schema.strict` set to `true`, succeed with the field
+discarded and a warning logged. The model may still return JSON if its prompt
+suggests it, but no schema constrains it. Anything we cannot parse is treated
+the same way: warn and serve, since rejecting over a field we were going to
+discard anyway would break clients for no benefit.
+
+`response_format.json_schema.strict: true` is different: the client is
+explicitly contracting for schema conformance we cannot provide, so the request
+is refused with `400` and an OpenAI-shaped error rather than answered with prose
+the client will fail to parse.
 
 Related: ADR-0001 records why the gateway does not emulate structured output.
 

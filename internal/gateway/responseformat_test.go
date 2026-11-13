@@ -59,7 +59,27 @@ func TestClassifyResponseFormatMalformedIsNotStrict(t *testing.T) {
 	}
 }
 
-// handlerFor builds a Server with enough wiring to exercise the entry point.
+// A response_format we cannot fully parse still asked for something, so it must
+// warn rather than vanish. Only "text" and a missing field are silent. The one
+// exception is a body too broken to parse at all — the conversion rejects that
+// on its own, so there is nothing to warn about.
+func TestClassifyResponseFormatWarnsForUnparseableShapes(t *testing.T) {
+	cases := []string{
+		`{"model":"m","response_format":"json_object"}`,
+		`{"model":"m","response_format":{"type":"json_schema","json_schema":"nope"}}`,
+		`{"model":"m","response_format":{"type":123}}`,
+		`{"model":"m","response_format":{"type":"json_schema","json_schema":{"strict":"true"}}}`,
+		`{"model":"m","response_format":{"type":"grammar","grammar":{"type":"string"}}}`,
+		`{"model":"m","response_format":{}}`,
+	}
+	for _, body := range cases {
+		if got := ClassifyResponseFormat([]byte(body)); got != rfDropped {
+			t.Errorf("ClassifyResponseFormat(%s) = %v, want rfDropped (warn, do not stay silent)", body, got)
+		}
+	}
+}
+
+// postChat drives the handler the way a client would.
 // The rejection path touches no pool or upstream, so a bare server suffices.
 func postChat(t *testing.T, srv *Server, body string) *httptest.ResponseRecorder {
 	t.Helper()
@@ -97,9 +117,8 @@ func TestChatCompletionsRejectsStrictResponseFormat(t *testing.T) {
 	if out.Error.Type == "" || out.Error.Message == "" {
 		t.Errorf("error envelope is incomplete: %+v", *out.Error)
 	}
-	if !strings.Contains(strings.ToLower(out.Error.Message), "structured output") &&
-		!strings.Contains(strings.ToLower(out.Error.Message), "json_schema") {
-		t.Errorf("message should name the unsupported capability, got %q", out.Error.Message)
+	if !strings.Contains(out.Error.Message, "response_format.json_schema.strict") {
+		t.Errorf("message should name the wire field that is unsupported, got %q", out.Error.Message)
 	}
 }
 
