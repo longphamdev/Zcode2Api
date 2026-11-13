@@ -41,6 +41,11 @@ There is no trustworthy source for `reasoning_tokens` in what the Origin
 reports. A zero would read as "measured, none used" rather than "not measured",
 so the object is omitted.
 
+Expect a compliance warning for this — `usage.completion_tokens_details is
+missing` on every non-stream test. It is not an oversight: filling in a zero
+would silence the warning while asserting a measurement that was never taken.
+If a source for reasoning tokens appears, emit the object then.
+
 ## `usage` is omitted rather than zeroed
 
 The same rule, applied to the whole object: when nothing was measured, the

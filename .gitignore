@@ -23,6 +23,7 @@ tests/
 .zcode/
 .kiro/
 PROJECT_MAP.md
+.scratch/
 
 # Node modules
 internal/captcha/captcha_node/node_modules/
