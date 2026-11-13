@@ -160,16 +160,11 @@ func NewServer(cfg config.Config) (*Server, error) {
 		ProfileForAccount: s.profileForAccountMid,
 		OnEgressFail:      s.rebindAccountLine,
 	}
+	// The walk calls the interface, so production must fill it in here. Leaving
+	// it to a nil-check fallback meant a typed-nil *upstream.Client sat inside a
+	// non-nil interface and panicked at the call site instead of at construction.
+	s.origin = s.up
 	return s, nil
-}
-
-// chatOrigin returns the Origin the walk should call: the injected one in
-// tests, otherwise the real client.
-func (s *Server) chatOrigin() chatSender {
-	if s.origin != nil {
-		return s.origin
-	}
-	return s.up
 }
 
 func (s *Server) importKeysFile() {
@@ -436,6 +431,16 @@ func anyPlanOffersModel(accs []store.Account, model string) bool {
 		}
 	}
 	return !scanned
+}
+
+// holdTick is how long the walk sleeps between passes while holding. A field in
+// the policy sense — the default matches the historic 15 seconds, and tests set
+// a short one so a retry does not cost fifteen seconds of wall clock.
+func (s *Server) holdTick() time.Duration {
+	if s.cfg.HoldTick > 0 {
+		return s.cfg.HoldTick
+	}
+	return 15 * time.Second
 }
 
 // poolOutcome is what the hold decision needs to know about the Pool.

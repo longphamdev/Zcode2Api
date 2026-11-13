@@ -75,7 +75,7 @@ walk:
 				dumped = true
 			}
 			log.Printf("POST chat model=%s acc=%s %db", model, maskJWT(acc.JWT), len(payload))
-			resp, err := s.chatOrigin().PostMessages(r.Context(), acc.JWT, acc.DeviceMid, payload, extra)
+			resp, err := s.origin.PostMessages(r.Context(), acc.JWT, acc.DeviceMid, payload, extra)
 			if err != nil {
 				// the client hung up: nothing downstream can succeed — no strike,
 				// no account switch, stop quietly (the write to a dead
@@ -234,7 +234,7 @@ walk:
 		case <-r.Context().Done():
 			// the client hung up while we held — quiet exit, no bytes wasted
 			return
-		case <-time.After(15 * time.Second):
+		case <-time.After(s.holdTick()):
 		}
 	}
 	// Tell the client when to come back. Both wire formats carry the header; the

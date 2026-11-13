@@ -53,6 +53,7 @@ type Config struct {
 	RiskCooldown   time.Duration
 	PrecheckBench  time.Duration // PRECHECK_BENCH: chat-health sweep bench for 3012 accounts
 	RequestHold    time.Duration // REQUEST_HOLD: hold a client request while the walk retries (0 = fail fast)
+	HoldTick       time.Duration // sleep between hold passes; 0 = the 15s default
 	ChatDump       string        // CHAT_DUMP: append full client+origin bodies (empty = off)
 }
 

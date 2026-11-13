@@ -700,6 +700,7 @@ func TestWalkHoldsAndRetriesAfterTransientFailure(t *testing.T) {
 		cfg: config.Config{
 			RequestHold:   10 * time.Minute,
 			AccountMaxTry: 1,
+			HoldTick:      100 * time.Millisecond,
 		},
 	}
 
@@ -722,8 +723,13 @@ func TestWalkHoldsAndRetriesAfterTransientFailure(t *testing.T) {
 	if origin.calls < 2 {
 		t.Errorf("origin called %d times, want >= 2 (the walk must retry after a transient failure)", origin.calls)
 	}
-	if rec.Code == http.StatusTooManyRequests || rec.Code == 529 {
-		t.Errorf("status = %d, want a retried success, not an overload", rec.Code)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 after the retry (body=%s)", rec.Code, rec.Body.String())
+	}
+	// A bare Recorder reports 200 even when nothing was written, so check the
+	// body is actually a completion rather than trusting the status alone.
+	if !strings.Contains(rec.Body.String(), "chat.completion") {
+		t.Errorf("body is not a completion: %q", rec.Body.String())
 	}
 }
 
@@ -789,5 +795,80 @@ func TestWalkFailsFastWhenPoolCannotRecover(t *testing.T) {
 	}
 	if origin.calls != 0 {
 		t.Errorf("origin called %d times, want 0", origin.calls)
+	}
+}
+
+// Scenario the ticket lists but nothing covered: an Account recovering inside
+// the window must be waited for and then served. With a short hold tick this is
+// cheap; the walk's sleep is a policy field rather than a bare 15-second literal.
+func TestWalkWaitsForRecoveryInsideWindowThenServes(t *testing.T) {
+	db, err := store.OpenStore(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	acc, err := db.Add("jwt.a", "a")
+	if err != nil {
+		t.Fatalf("add account: %v", err)
+	}
+	if err := db.UpdateQuota(acc.ID, store.Quota{
+		Remaining: 10, Limit: 10,
+		Entitlements: []map[string]any{{"name": "GLM-5.3", "limit": 10, "remaining": 10}},
+	}); err != nil {
+		t.Fatalf("set quota: %v", err)
+	}
+	// Cooling for a brief moment, well inside the hold window.
+	db.SetCooling(acc.ID, time.Now().Add(600*time.Millisecond).Unix())
+	if err := db.Select(acc.ID); err != nil {
+		t.Fatalf("select: %v", err)
+	}
+
+	sse := strings.Join([]string{
+		`event: message_start` + "\n" + `data: {"type":"message_start","message":{"usage":{"input_tokens":5}}}` + "\n\n",
+		`event: content_block_start` + "\n" + `data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}` + "\n\n",
+		`event: content_block_delta` + "\n" + `data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}` + "\n\n",
+		`event: message_delta` + "\n" + `data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":5,"output_tokens":1}}` + "\n\n",
+		`event: message_stop` + "\n" + `data: {"type":"message_stop"}` + "\n\n",
+	}, "")
+
+	origin := &fakeOrigin{reply: func(int) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": {"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(sse)),
+		}, nil
+	}}
+
+	srv := &Server{
+		store:     db,
+		catalog:   NewCatalog(nil),
+		origin:    origin,
+		stickyAcc: map[string]int64{},
+		quota1005: map[string]int{},
+		chatOK:    map[int64]time.Time{},
+		cfg: config.Config{
+			RequestHold:   10 * time.Minute,
+			AccountMaxTry: 1,
+			HoldTick:      100 * time.Millisecond,
+		},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"GLM-5.3","messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+
+	start := time.Now()
+	srv.handleChatCompletions(rec, req)
+	elapsed := time.Since(start)
+
+	if origin.calls == 0 {
+		t.Fatal("the Origin was never called; the walk gave up instead of waiting")
+	}
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200 after the cooldown lapsed (body=%s)", rec.Code, rec.Body.String())
+	}
+	if elapsed > 5*time.Second {
+		t.Errorf("took %s; should serve as soon as the cooldown lapses", elapsed.Round(time.Millisecond))
 	}
 }
