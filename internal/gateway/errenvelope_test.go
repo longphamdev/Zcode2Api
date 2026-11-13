@@ -533,3 +533,38 @@ func TestMessageDocumentWithoutOptionalFieldsStillRenders(t *testing.T) {
 		})
 	}
 }
+
+// The request log must record what the client got, which the Origin's status no
+// longer tells: a 2xx the gateway could not render went out as 502, and a stream
+// that failed after its first chunk kept its 200.
+func TestOriginRenderingReportsWhatTheClientGot(t *testing.T) {
+	run := func(body string, stream bool) (int, bool) {
+		var scn usageScanner
+		tee := io.NopCloser(io.TeeReader(strings.NewReader(body), &scn))
+		resp := &http.Response{StatusCode: 200, Body: tee}
+		srv := &Server{}
+		return srv.writeOpenAIFromOrigin(httptest.NewRecorder(), resp, []byte(body), tee, "glm-5.3", stream, &scn, false)
+	}
+	cases := []struct {
+		name       string
+		body       string
+		stream     bool
+		wantStatus int
+		wantOK     bool
+	}{
+		{"json reply", `{"type":"message","stop_reason":"end_turn","content":[{"type":"text","text":"hi"}]}`, false, 200, true},
+		{"json garbage under 200", `{}`, false, 502, false},
+		{"stream finished", sseStart + sseText + sseStop, true, 200, true},
+		{"stream failed before first chunk", sseStart + sseError, true, 502, false},
+		{"stream failed after first chunk", sseStart + sseText + sseError, true, 200, false},
+		{"collected stream failed", sseStart + sseText, false, 502, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			status, ok := run(c.body, c.stream)
+			if status != c.wantStatus || ok != c.wantOK {
+				t.Errorf("reported (%d, %v), want (%d, %v)", status, ok, c.wantStatus, c.wantOK)
+			}
+		})
+	}
+}

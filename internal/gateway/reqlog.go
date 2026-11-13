@@ -59,10 +59,14 @@ func (l *reqLog) Add(e ReqEntry) {
 	l.stats.cacheTok += int64(e.Cache)
 }
 
-// LogOK records a finished request (forward.go hot path).
-func LogOK(mdl, acc string, status int, stream bool, tFirst, tTotal time.Duration, usg Usage) {
+// LogOK records a finished request (forward.go hot path). status and ok are
+// what the gateway wrote, not what the Origin returned: a 2xx the gateway could
+// not render goes out as 502, and a stream that fails after its first chunk
+// keeps the 200 already sent, so the status alone no longer says whether the
+// client got a reply.
+func LogOK(mdl, acc string, status int, ok, stream bool, tFirst, tTotal time.Duration, usg Usage) {
 	rlog.Add(ReqEntry{
-		TS: time.Now(), Model: mdl, Account: acc, OK: status == 200,
+		TS: time.Now(), Model: mdl, Account: acc, OK: ok,
 		Status: status, Stream: stream,
 		TFirst: tFirst.Milliseconds(), TTotal: tTotal.Milliseconds(),
 		InTok: usg.In, OutTok: usg.Out, Cache: usg.CacheRead + usg.CacheCreate,

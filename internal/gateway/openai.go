@@ -373,7 +373,12 @@ func writeSSEChunk(w http.ResponseWriter, fl http.Flusher, chunk map[string]any)
 	}
 }
 
-func (s *Server) writeOpenAIFromOrigin(w http.ResponseWriter, resp *http.Response, head []byte, rest io.ReadCloser, outModel string, stream bool, scn *usageScanner, includeUsage bool) {
+// writeOpenAIFromOrigin renders the Origin's reply in OpenAI shape. It reports
+// the HTTP status it wrote and whether the client got a reply: the two differ
+// once a stream has started, where a failure keeps the 200 already sent and
+// travels as an error frame. The request log must record what the client saw,
+// not what the Origin said.
+func (s *Server) writeOpenAIFromOrigin(w http.ResponseWriter, resp *http.Response, head []byte, rest io.ReadCloser, outModel string, stream bool, scn *usageScanner, includeUsage bool) (status int, ok bool) {
 	defer resp.Body.Close()
 	id := "chatcmpl-" + util.GenerateUUID()
 	// rest (the wrapped resp.Body) already starts with head — head feeds
@@ -385,12 +390,11 @@ func (s *Server) writeOpenAIFromOrigin(w http.ResponseWriter, resp *http.Respons
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		raw, _ := io.ReadAll(io.LimitReader(rest, 8<<20))
 		writeOpenAIFromOriginError(w, resp.StatusCode, raw)
-		return
+		return resp.StatusCode, false
 	}
 	if !upstream.IsSSE(head) {
 		// non-stream upstream: a complete Anthropic message JSON — convert it
-		writeOpenAIFromJSON(w, resp.StatusCode, rest, id, outModel, scn)
-		return
+		return writeOpenAIFromJSON(w, resp.StatusCode, rest, id, outModel, scn)
 	}
 	src := rest
 	if !stream {
@@ -402,7 +406,7 @@ func (s *Server) writeOpenAIFromOrigin(w http.ResponseWriter, resp *http.Respons
 			// gets the fixed one — scanner internals are not for the client.
 			log.Printf("[openai] Origin stream could not be rendered as a reply: %v", err)
 			writeOpenAIError(w, http.StatusBadGateway, originStreamMessage(err))
-			return
+			return http.StatusBadGateway, false
 		}
 		msg := map[string]any{"role": "assistant", "content": text}
 		finish := "stop"
@@ -420,7 +424,7 @@ func (s *Server) writeOpenAIFromOrigin(w http.ResponseWriter, resp *http.Respons
 				"index": 0, "message": msg, "finish_reason": finish,
 			}},
 		}, scn.Usage()))
-		return
+		return http.StatusOK, true
 	}
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -455,10 +459,10 @@ func (s *Server) writeOpenAIFromOrigin(w http.ResponseWriter, resp *http.Respons
 		}
 		if !wrote {
 			writeOpenAIError(w, http.StatusBadGateway, msg)
-			return
+			return http.StatusBadGateway, false
 		}
 		writeSSEChunk(w, fl, oaErrorFrame(msg))
-		return
+		return http.StatusOK, false
 	}
 	// The scanner has now seen the whole body, message_delta included, so the
 	// token triple is complete. A client that asked for it gets one terminal
@@ -474,6 +478,7 @@ func (s *Server) writeOpenAIFromOrigin(w http.ResponseWriter, resp *http.Respons
 	if fl != nil {
 		fl.Flush()
 	}
+	return http.StatusOK, true
 }
 
 // oaUsage renders a scanned Anthropic usage triple as the OpenAI `usage`
@@ -577,11 +582,11 @@ func rawScalarString(raw json.RawMessage) string {
 
 // writeOpenAIFromJSON converts a complete Anthropic message document (the
 // origin's non-stream reply) into an OpenAI chat.completion.
-func writeOpenAIFromJSON(w http.ResponseWriter, status int, body io.Reader, id, outModel string, scn *usageScanner) {
+func writeOpenAIFromJSON(w http.ResponseWriter, status int, body io.Reader, id, outModel string, scn *usageScanner) (int, bool) {
 	raw, err := io.ReadAll(io.LimitReader(body, 8<<20))
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadGateway, "read origin response: "+err.Error())
-		return
+		return http.StatusBadGateway, false
 	}
 	var doc struct {
 		Type       string          `json:"type"`
@@ -596,7 +601,7 @@ func writeOpenAIFromJSON(w http.ResponseWriter, status int, body io.Reader, id, 
 		// offset, which is enough to diagnose without logging the body itself.
 		log.Printf("[openai] Origin returned %d with a body that is not a message document (%d bytes): %v", status, len(raw), err)
 		writeOpenAIError(w, http.StatusBadGateway, "origin returned a malformed response")
-		return
+		return http.StatusBadGateway, false
 	}
 	// Valid JSON is not yet a reply. `null`, `{}` or an unrelated object decode
 	// into an empty document without error, and used to come out the other side
@@ -615,7 +620,7 @@ func writeOpenAIFromJSON(w http.ResponseWriter, status int, body io.Reader, id, 
 	if !startsWithByte(doc.Content, '[') || (doc.Type != "" && doc.Type != "message") || json.Unmarshal(doc.Content, &blocks) != nil {
 		log.Printf("[openai] Origin returned %d with JSON that is not a message document (%d bytes)", status, len(raw))
 		writeOpenAIError(w, http.StatusBadGateway, "origin returned a malformed response")
-		return
+		return http.StatusBadGateway, false
 	}
 	text := strings.Builder{}
 	var tools []any
@@ -651,6 +656,7 @@ func writeOpenAIFromJSON(w http.ResponseWriter, status int, body io.Reader, id, 
 			"index": 0, "message": msg, "finish_reason": finish,
 		}},
 	}, scn.Usage()))
+	return status, true
 }
 
 // startsWithByte reports whether the first non-space byte of raw is c.

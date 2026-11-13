@@ -198,12 +198,17 @@ walk:
 				Reader: io.TeeReader(io.MultiReader(bytes.NewReader(head), resp.Body), scn),
 				Closer: resp.Body,
 			}
+			// The log records what the client received. On the OpenAI path that
+			// can differ from the Origin's status: a 2xx the gateway could not
+			// render is a 502, and a stream that fails after its first chunk is a
+			// 200 that was not a reply.
+			status, ok := resp.StatusCode, resp.StatusCode == http.StatusOK
 			if openai {
-				s.writeOpenAIFromOrigin(w, resp, head, resp.Body, model, ParseStream(body), scn, includeUsage)
+				status, ok = s.writeOpenAIFromOrigin(w, resp, head, resp.Body, model, ParseStream(body), scn, includeUsage)
 			} else {
 				copyOrigin(w, resp, head)
 			}
-			LogOK(model, maskJWT(acc.JWT), resp.StatusCode, ParseStream(body), 0, time.Since(reqStart), scn.Usage())
+			LogOK(model, maskJWT(acc.JWT), status, ok, ParseStream(body), 0, time.Since(reqStart), scn.Usage())
 			return
 		}
 		// What the pool can do for this model is decided before the hold is:
