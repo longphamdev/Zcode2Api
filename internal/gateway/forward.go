@@ -26,10 +26,10 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	s.routeAnthropic(w, r, body, false)
+	s.routeAnthropic(w, r, body, false, false)
 }
 
-func (s *Server) routeAnthropic(w http.ResponseWriter, r *http.Request, body []byte, openai bool) {
+func (s *Server) routeAnthropic(w http.ResponseWriter, r *http.Request, body []byte, openai, includeUsage bool) {
 	body = s.injectDefaults(body)
 	model := upstream.ParseModel(body)
 	if model == "" {
@@ -197,7 +197,7 @@ walk:
 				Closer: resp.Body,
 			}
 			if openai {
-				s.writeOpenAIFromOrigin(w, resp, head, resp.Body, model, ParseStream(body), scn)
+				s.writeOpenAIFromOrigin(w, resp, head, resp.Body, model, ParseStream(body), scn, includeUsage)
 			} else {
 				copyOrigin(w, resp, head)
 			}
@@ -542,6 +542,22 @@ func ParseStream(body []byte) bool {
 	}
 	_ = json.Unmarshal(body, &obj)
 	return obj.Stream
+}
+
+// ParseIncludeUsage reports whether the client asked for a terminal usage chunk
+// via stream_options.include_usage. Absent, false, or a missing stream_options
+// block all mean no: the stream shape must not change for clients that did not
+// ask.
+func ParseIncludeUsage(body []byte) bool {
+	var obj struct {
+		StreamOptions *struct {
+			IncludeUsage bool `json:"include_usage"`
+		} `json:"stream_options"`
+	}
+	if json.Unmarshal(body, &obj) != nil || obj.StreamOptions == nil {
+		return false
+	}
+	return obj.StreamOptions.IncludeUsage
 }
 
 // copyOrigin streams the origin response to the client unchanged. resp.Body

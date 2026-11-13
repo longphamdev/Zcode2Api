@@ -159,7 +159,7 @@ func TestWriteOpenAIFromOriginSSECollectedEmitsUsage(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	srv := &Server{}
-	srv.writeOpenAIFromOrigin(rec, resp, head, tee, "glm-5.3", false, &scn)
+	srv.writeOpenAIFromOrigin(rec, resp, head, tee, "glm-5.3", false, &scn, false)
 
 	out := decodeBody(t, rec)
 	u := usageFrom(t, out)

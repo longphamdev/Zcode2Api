@@ -23,12 +23,16 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	// The OpenAI-only request options have to be read from the client's body:
+	// the Anthropic wire format has no place for them, so the conversion below
+	// drops them.
+	includeUsage := ParseIncludeUsage(raw)
 	anth, err := OpenAIToAnthropic(raw)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	s.routeAnthropic(w, r, anth, true)
+	s.routeAnthropic(w, r, anth, true, includeUsage)
 }
 
 func OpenAIToAnthropic(raw []byte) ([]byte, error) {
@@ -261,7 +265,7 @@ func (m oaMessage) contentBlocks() []any {
 	return blocks
 }
 
-func (s *Server) writeOpenAIFromOrigin(w http.ResponseWriter, resp *http.Response, head []byte, rest io.ReadCloser, outModel string, stream bool, scn *usageScanner) {
+func (s *Server) writeOpenAIFromOrigin(w http.ResponseWriter, resp *http.Response, head []byte, rest io.ReadCloser, outModel string, stream bool, scn *usageScanner, includeUsage bool) {
 	defer resp.Body.Close()
 	id := "chatcmpl-" + util.GenerateUUID()
 	// rest (the wrapped resp.Body) already starts with head — head feeds
@@ -313,6 +317,28 @@ func (s *Server) writeOpenAIFromOrigin(w http.ResponseWriter, resp *http.Respons
 	})
 	if err != nil {
 		return
+	}
+	// The scanner has now seen the whole body, message_delta included, so the
+	// token triple is complete. A client that asked for it gets one terminal
+	// chunk with an empty choices array — the shape OpenAI uses — and then the
+	// [DONE] sentinel. Clients that did not ask see exactly what they saw
+	// before.
+	if includeUsage {
+		if usage := oaUsage(scn.Usage()); usage != nil {
+			chunk := map[string]any{
+				"id":      id,
+				"object":  "chat.completion.chunk",
+				"created": time.Now().Unix(),
+				"model":   outModel,
+				"choices": []any{},
+				"usage":   usage,
+			}
+			b, _ := json.Marshal(chunk)
+			fmt.Fprintf(w, "data: %s\n\n", b)
+			if fl != nil {
+				fl.Flush()
+			}
+		}
 	}
 	fmt.Fprintf(w, "data: [DONE]\n\n")
 	if fl != nil {
