@@ -22,8 +22,12 @@ func TestRecoveryAtReadyWhenAccountServable(t *testing.T) {
 	now := time.Now()
 	accs := []store.Account{{ID: 1}}
 
-	if until, _, waiting := recoveryAt(accs, nil, "GLM-5.3", now); waiting {
+	until, readyNow, waiting := recoveryAt(accs, nil, "GLM-5.3", now)
+	if waiting {
 		t.Errorf("reported a wait of %s, but an account is servable now", until)
+	}
+	if !readyNow {
+		t.Error("readyNow = false for a servable account; \"no wait\" alone also describes a hopeless pool")
 	}
 }
 
@@ -88,8 +92,12 @@ func TestRecoveryAtServableBeatsCooldown(t *testing.T) {
 		{ID: 2},
 	}
 
-	if _, _, waiting := recoveryAt(accs, nil, "GLM-5.3", now); waiting {
+	_, readyNow, waiting := recoveryAt(accs, nil, "GLM-5.3", now)
+	if waiting {
 		t.Error("a servable account means no wait is needed")
+	}
+	if !readyNow {
+		t.Error("readyNow = false; the servable account must be seen past the cooling one")
 	}
 }
 
@@ -364,11 +372,17 @@ func TestUnknownModelIsNotOverload(t *testing.T) {
 	}
 }
 
-// A pool that is merely exhausted is still an overload: the model exists, there
-// is just nothing free right now.
+// A pool with nothing left to wait for is still an overload when some plan
+// carries the model: the model exists, the pool just cannot serve it. Every
+// Account here is excluded for good, so the only path to the answer is the plan
+// check — a temporary blocker would decide the outcome before that check and
+// leave it untested.
 func TestExhaustedPoolIsOverloadNotUnsupported(t *testing.T) {
 	now := time.Now()
-	accs := []store.Account{{ID: 1, CoolingUntil: now.Add(30 * time.Minute).Unix()}}
+	accs := []store.Account{
+		{ID: 1, Status: "revoked", QuotaJSON: `[{"name":"GLM-5.3","limit":10,"remaining":10}]`},
+		{ID: 2, QuotaJSON: `[{"name":"other","limit":10,"remaining":10}]`},
+	}
 
 	outcome, _ := poolAvailability(accs, nil, "GLM-5.3", now, now.Add(10*time.Minute))
 	if outcome != poolHopeless {
@@ -411,6 +425,10 @@ func TestExhaustedPoolStatusAndRetryAfter(t *testing.T) {
 // served right now: the client reads 400 as its own mistake and never retries,
 // while 529 invites one. An Account whose plan was never scanned says nothing
 // about which models exist, so it must never produce "unsupported".
+//
+// An active unscanned Account is simply servable, which settles the outcome
+// before any plan is consulted; the expired rows are what drive the plan check,
+// because only a pool with nothing to wait for reaches it.
 func TestUnscannedPlanNeverConcludesUnsupported(t *testing.T) {
 	now := time.Now()
 	holdUntil := now.Add(10 * time.Minute)
@@ -418,28 +436,44 @@ func TestUnscannedPlanNeverConcludesUnsupported(t *testing.T) {
 	cases := []struct {
 		name string
 		accs []store.Account
+		want poolOutcome
 	}{
 		{
-			name: "freshly added account, plan not fetched yet",
+			name: "freshly added account, plan not fetched yet: try it",
 			accs: []store.Account{{ID: 1}}, // empty QuotaJSON
+			want: poolReadyNow,
 		},
 		{
-			name: "account cooling with an unscanned plan",
-			accs: []store.Account{{ID: 1, CoolingUntil: now.Add(30 * time.Minute).Unix()}},
+			name: "expired account with an unscanned plan",
+			accs: []store.Account{{ID: 1, Status: "expired"}},
+			want: poolHopeless,
 		},
 		{
-			name: "mix: one scanned without the model, one unscanned",
+			name: "mix: one scanned without the model, one unscanned and active",
 			accs: []store.Account{
 				{ID: 1, QuotaJSON: `[{"name":"other","limit":10,"remaining":10}]`},
 				{ID: 2},
 			},
+			want: poolReadyNow,
+		},
+		{
+			name: "mix: one scanned without the model, one unscanned and expired",
+			accs: []store.Account{
+				{ID: 1, QuotaJSON: `[{"name":"other","limit":10,"remaining":10}]`},
+				{ID: 2, Status: "expired"},
+			},
+			want: poolHopeless,
 		},
 	}
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if outcome, _ := poolAvailability(c.accs, nil, "GLM-5.3", now, holdUntil); outcome == poolUnsupportedModel {
-				t.Error("an unscanned plan cannot prove a model unsupported; this would answer 400 for a valid model")
+			outcome, _ := poolAvailability(c.accs, nil, "GLM-5.3", now, holdUntil)
+			if outcome == poolUnsupportedModel {
+				t.Fatal("an unscanned plan cannot prove a model unsupported; this would answer 400 for a valid model")
+			}
+			if outcome != c.want {
+				t.Errorf("outcome = %v, want %v", outcome, c.want)
 			}
 		})
 	}
@@ -452,16 +486,20 @@ func TestMixedPoolIsOverloadNotUnsupported(t *testing.T) {
 	now := time.Now()
 	holdUntil := now.Add(10 * time.Minute)
 
+	// Every row is excluded for good. A temporary blocker — cooling, spent
+	// quota — would make the pool "waiting" and settle the outcome before the
+	// plans are consulted, which is the check this test exists for.
 	accs := []store.Account{
 		// Supports the model, but expired.
 		{ID: 1, Status: "expired",
 			QuotaJSON: `[{"name":"GLM-5.3","limit":10,"remaining":10}]`},
 		// Active, but its plan does not include this model.
 		{ID: 2, QuotaJSON: `[{"name":"other","limit":10,"remaining":10}]`},
-		// Supports the model, quota spent.
-		{ID: 3, QuotaJSON: `[{"name":"GLM-5.3","limit":10,"remaining":0}]`},
-		// Supports the model, cooling well past the hold.
-		{ID: 4, CoolingUntil: now.Add(30 * time.Minute).Unix(),
+		// Supports the model, revoked.
+		{ID: 3, Status: "revoked",
+			QuotaJSON: `[{"name":"GLM-5.3","limit":10,"remaining":10}]`},
+		// Supports the model, deliberately excluded from serving it.
+		{ID: 4, DisabledModels: "glm53",
 			QuotaJSON: `[{"name":"GLM-5.3","limit":10,"remaining":10}]`},
 	}
 
@@ -475,40 +513,38 @@ func TestMixedPoolIsOverloadNotUnsupported(t *testing.T) {
 }
 
 // pickExcept matches model names through Norm (case and punctuation stripped).
-// The unsupported check has to agree, or a valid alias is answered 400.
+// The unsupported check has to agree, or a valid alias is answered 400. The
+// Account is expired so the plan check is the only thing that can answer; an
+// active one is servable under any spelling and never consults the plan.
 func TestUnsupportedCheckUsesNormalisedNames(t *testing.T) {
 	now := time.Now()
 	holdUntil := now.Add(10 * time.Minute)
 
 	accs := []store.Account{{
 		ID:        1,
+		Status:    "expired",
 		QuotaJSON: `[{"name":"GLM-5.3","limit":10,"remaining":10}]`,
 	}}
 
 	for _, spelling := range []string{"GLM-5.3", "glm-5.3", "glm53", "GLM53"} {
 		outcome, _ := poolAvailability(accs, nil, spelling, now, holdUntil)
-		if outcome == poolUnsupportedModel {
-			t.Errorf("%q answered unsupported, but the plan carries that model under a different spelling", spelling)
+		if outcome != poolHopeless {
+			t.Errorf("%q: outcome = %v, want poolHopeless — the plan carries that model under a different spelling", spelling, outcome)
 		}
 	}
 }
 
 // Every Account unscanned: the pool knows nothing about which models exist, so
-// it must not claim one is unsupported. This exercises the fallback that a
-// single unscanned Account would otherwise mask by returning early.
+// it must not claim one is unsupported. Each is expired so recoveryAt reports
+// nothing waiting, which is the only path that consults the plans at all — a
+// dead marker would be a wait, and settle the outcome before they are read.
 func TestAllUnscannedPlansNeverConcludeUnsupported(t *testing.T) {
 	now := time.Now()
-	// Each is model-dead so recoveryAt reports nothing waiting, which is the only
-	// path that consults the plan at all.
-	accs := []store.Account{{ID: 1}, {ID: 2}}
-	dead := map[string]int64{
-		"1:glm53": now.Add(30 * time.Minute).Unix(),
-		"2:glm53": now.Add(40 * time.Minute).Unix(),
-	}
+	accs := []store.Account{{ID: 1, Status: "expired"}, {ID: 2, Status: "revoked"}}
 
-	outcome, _ := poolAvailability(accs, dead, "GLM-5.3", now, now.Add(10*time.Minute))
-	if outcome == poolUnsupportedModel {
-		t.Error("a pool with no scanned plans cannot prove a model unsupported")
+	outcome, _ := poolAvailability(accs, nil, "GLM-5.3", now, now.Add(10*time.Minute))
+	if outcome != poolHopeless {
+		t.Errorf("outcome = %v, want poolHopeless — a pool with no scanned plans cannot prove a model unsupported", outcome)
 	}
 }
 
@@ -524,8 +560,8 @@ func TestExpiredAccountsStillTestifyForModel(t *testing.T) {
 	}}
 
 	outcome, _ := poolAvailability(accs, nil, "GLM-5.3", now, now.Add(10*time.Minute))
-	if outcome == poolUnsupportedModel {
-		t.Error("an expired account's plan proves the model exists; overload must not read as unsupported")
+	if outcome != poolHopeless {
+		t.Errorf("outcome = %v, want poolHopeless — an expired account's plan proves the model exists; overload must not read as unsupported", outcome)
 	}
 }
 
