@@ -209,10 +209,13 @@ walk:
 			break walk
 		}
 		// Holding only helps if something in the pool can recover inside the
-		// window. When the earliest recovery is further out, the client would
-		// sit here until the deadline to be told what was known at once — drop
-		// the hold and answer now.
-		if !s.poolWillRecoverInTime(model, holdUntil) {
+		// window. When the earliest recovery is further out — or nothing will
+		// ever recover — the client would sit here until the deadline to be told
+		// what was known at once, so answer now.
+		//
+		// A pool that is ready-now is NOT this case: a walk can fail transiently
+		// with every Account still healthy, and the next pass may succeed.
+		if s.poolIsHopeless(model, holdUntil) {
 			break walk
 		}
 		select {
@@ -244,7 +247,7 @@ func (s *Server) retryAfterSeconds(model string) string {
 	if err != nil {
 		return "0"
 	}
-	recover, waiting := recoveryAt(accs, s.store.DeadUntil(), model, time.Now())
+	recover, _, waiting := recoveryAt(accs, s.store.DeadUntil(), model, time.Now())
 	if !waiting {
 		return "0"
 	}
@@ -255,16 +258,15 @@ func (s *Server) retryAfterSeconds(model string) string {
 	return strconv.Itoa(secs)
 }
 
-// poolWillRecoverInTime reports whether waiting for this model can help before
-// holdUntil. It is deliberately cheap: a pool snapshot, no origin traffic.
-func (s *Server) poolWillRecoverInTime(model string, holdUntil time.Time) bool {
+// poolIsHopeless reports whether no Account can serve this model before
+// holdUntil. Deliberately cheap: a pool snapshot, no Origin traffic.
+func (s *Server) poolIsHopeless(model string, holdUntil time.Time) bool {
 	accs, err := s.store.Accounts()
 	if err != nil {
-		return false
+		return false // an unreadable pool is not proof of hopelessness
 	}
-	dead := s.store.DeadUntil()
-	recover, waiting := recoveryAt(accs, dead, model, time.Now())
-	return shouldHold(recover, waiting, holdUntil)
+	outcome, _ := poolAvailability(accs, s.store.DeadUntil(), model, time.Now(), holdUntil)
+	return outcome == poolHopeless
 }
 
 func (s *Server) injectDefaults(body []byte) []byte {

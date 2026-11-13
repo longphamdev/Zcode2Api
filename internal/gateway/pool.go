@@ -374,14 +374,42 @@ func (s *Server) pickExcept(model string, skip map[int64]bool) (*store.Account, 
 	return nil, fmt.Errorf("pool empty for model %s", model)
 }
 
-// shouldHold reports whether waiting for the rest of the hold window can
-// plausibly help. It cannot when nothing in the pool will recover in time: the
-// client would be held to the deadline only to be told what was already known.
-func shouldHold(recover time.Time, waiting bool, holdUntil time.Time) bool {
-	if !waiting {
-		return false
+// poolOutcome is what the hold decision needs to know about the Pool.
+type poolOutcome int
+
+const (
+	// poolReadyNow: some Account can serve at this instant. This is NOT a reason
+	// to give up — a walk that just failed transiently leaves every Account
+	// servable, and the next pass may well succeed. Keep holding.
+	poolReadyNow poolOutcome = iota
+	// poolRecoveringSoon: nothing servable now, but something recovers inside
+	// the hold window. Hold.
+	poolRecoveringSoon
+	// poolHopeless: nothing servable now and nothing will be inside the window.
+	// Holding is pure loss.
+	poolHopeless
+)
+
+// neverRecovers reports whether the Pool can never become usable for this model
+// again: every Account is empty of candidates, expired, revoked, excluded, or
+// has nothing but a busy-but-healthy state. Used by poolAvailability below.
+//
+// This distinction is the whole point: conflating "servable" with "hopeless"
+// makes every transient failure — a 429 the egress walk already absorbed, a 5xx
+// — end the hold immediately, which is the behaviour this change must not
+// introduce.
+func poolAvailability(accs []store.Account, dead map[int64]int64, model string, now, holdUntil time.Time) (poolOutcome, time.Time) {
+	recover, readyNow, waiting := recoveryAt(accs, dead, model, now)
+	switch {
+	case readyNow:
+		return poolReadyNow, time.Time{}
+	case !waiting:
+		return poolHopeless, time.Time{}
+	case recover.After(holdUntil):
+		return poolHopeless, recover
+	default:
+		return poolRecoveringSoon, recover
 	}
-	return !recover.After(holdUntil)
 }
 
 // modelExcluded reports whether an Account is deliberately excluded from
@@ -401,14 +429,16 @@ func modelExcluded(a store.Account, model string) bool {
 }
 
 // recoveryAt answers: if no Account can serve this model right now, when will
-// one be able to? waiting=false means either the pool is ready now, or nothing
-// in it will ever become ready for this model — neither is a wait to sit out.
+// one be able to?
 //
 // This exists so the request walk can tell "wait, help is coming" from "waiting
 // is pointless". pickExcept collapses every refusal into a nil Account, which
 // cannot distinguish an Account recovering in thirty seconds from one that
 // expired for good.
-func recoveryAt(accs []store.Account, dead map[int64]int64, model string, now time.Time) (time.Time, bool) {
+// It reports readyNow when some Account can serve this instant, which is not
+// the same as "nothing to wait for" — a walk that just failed transiently
+// leaves the pool ready-now, and the next pass may succeed.
+func recoveryAt(accs []store.Account, dead map[int64]int64, model string, now time.Time) (recover time.Time, readyNow bool, waiting bool) {
 	nowUnix := now.Unix()
 	var earliest int64
 	found := false
@@ -438,13 +468,13 @@ func recoveryAt(accs []store.Account, dead map[int64]int64, model string, now ti
 			consider(a.CoolingUntil)
 			continue
 		}
-		// Servable right now — nothing to wait for.
-		return time.Time{}, false
+		// Servable right now.
+		return time.Time{}, true, false
 	}
 	if !found {
-		return time.Time{}, false
+		return time.Time{}, false, false // hopeless: nothing will recover
 	}
-	return time.Unix(earliest, 0), true
+	return time.Unix(earliest, 0), false, true
 }
 
 func (s *Server) markQuotaDead(cur *store.Account, model string) {
