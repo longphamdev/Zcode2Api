@@ -32,6 +32,10 @@ type offeredPlan struct {
 	PlanID   string
 	Name     string
 	Priority int
+	// EndsAt is the plan window's end (unix seconds, 0 when the face did not
+	// carry one). It is what the reference client holds until after a
+	// successful claim, so an owned plan stops costing polls.
+	EndsAt int64
 }
 
 // marketingNode is a banner/popup, which may nest buttons.
@@ -91,6 +95,9 @@ func planFromMap(m map[string]any) (offeredPlan, bool) {
 	}
 	if pr, ok := m["priority"].(float64); ok {
 		p.Priority = int(pr)
+	}
+	if e, ok := m["ends_at"].(float64); ok && e > 0 {
+		p.EndsAt = int64(e)
 	}
 	return p, true
 }

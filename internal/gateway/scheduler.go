@@ -66,15 +66,36 @@ func (s *Server) claimDueAccounts() {
 	if err != nil {
 		return
 	}
+	now := time.Now().Unix()
 	for _, a := range accs {
 		if a.Status != "" {
 			continue
 		}
+		// A campaign already won needs no polling until its window closes.
+		// Without this the tick keeps asking the Origin for an Account that
+		// holds the plan — three requests every five minutes, all day, to be
+		// told "already have".
+		holdKey := "claim_hold_" + strconv.FormatInt(a.ID, 10)
+		if until, _ := strconv.ParseInt(s.store.Setting(holdKey, "0"), 10, 64); until > now {
+			continue
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-		claimed, problems := s.up.ClaimOfferedPlans(ctx, a.JWT, a.DeviceMid)
+		claimed, problems, hold := s.up.ClaimOfferedPlansWithHold(ctx, a.JWT, a.DeviceMid)
 		cancel()
+		if hold > 0 {
+			// Capped, deliberately unlike the reference client. Its success
+			// hold is the raw ends_at, so a long plan stops its poll for that
+			// whole term; here a single far-future ends_at would switch the
+			// claim tick off for every future campaign and leave no trace.
+			// A day's cap still removes the 288-polls-a-day waste while
+			// guaranteeing the tick re-asks soon enough to catch a new one.
+			if maxHold := now + int64((24 * time.Hour).Seconds()); hold > maxHold {
+				hold = maxHold
+			}
+			s.store.SetSetting(holdKey, strconv.FormatInt(hold, 10))
+		}
 		if claimed != "" || (problems != "" && !strings.HasPrefix(problems, "already have:")) {
-			log.Printf("[claim-tick] %s claimed=%q problems=%q", maskJWT(a.JWT), claimed, problems)
+			log.Printf("[claim-tick] %s claimed=%q problems=%q hold=%d", maskJWT(a.JWT), claimed, problems, hold)
 		}
 	}
 }

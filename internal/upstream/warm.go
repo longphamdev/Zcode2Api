@@ -93,6 +93,17 @@ func (c *Client) postEvent(ctx context.Context, jwt, element, userID, mid string
 // empty when nothing is offered). The manual dashboard Claim runs exactly
 // this (no activation events — those belong to the warm admission flow).
 func (c *Client) ClaimOfferedPlans(ctx context.Context, jwt, mid string) (string, string) {
+	claimed, problems, _ := c.ClaimOfferedPlansWithHold(ctx, jwt, mid)
+	return claimed, problems
+}
+
+// ClaimOfferedPlansWithHold is ClaimOfferedPlans plus the hold horizon: the
+// latest ends_at among the plans this account now owns. A campaign that has
+// been won does not need polling — the reference client holds until the plan
+// window closes, which is what stops an owned Account from costing three
+// requests every tick for the whole campaign. Zero means "no horizon known,
+// keep the normal cadence".
+func (c *Client) ClaimOfferedPlansWithHold(ctx context.Context, jwt, mid string) (string, string, int64) {
 	base := config.OriginBaseURL + "/api/v1/zcode-plan"
 	// The preview is one face and the banner is the other. A preview that fails
 	// must NOT end the walk: the reference client degrades a 404 to an empty
@@ -109,6 +120,7 @@ func (c *Client) ClaimOfferedPlans(ctx context.Context, jwt, mid string) (string
 				PlanID   string `json:"plan_id"`
 				Name     string `json:"name"`
 				Priority int    `json:"priority"`
+				EndsAt   int64  `json:"ends_at"`
 			} `json:"plans"`
 		} `json:"data"`
 	}
@@ -131,7 +143,7 @@ func (c *Client) ClaimOfferedPlans(ctx context.Context, jwt, mid string) (string
 		if p.PlanID == "" {
 			continue
 		}
-		plans = append(plans, offeredPlan{PlanID: p.PlanID, Name: p.Name, Priority: p.Priority})
+		plans = append(plans, offeredPlan{PlanID: p.PlanID, Name: p.Name, Priority: p.Priority, EndsAt: p.EndsAt})
 	}
 	seen := map[string]bool{}
 	for _, p := range plans {
@@ -147,7 +159,7 @@ func (c *Client) ClaimOfferedPlans(ctx context.Context, jwt, mid string) (string
 	// Neither face offered anything. If the preview was the reason, say so
 	// rather than reporting a clean "nothing offered".
 	if len(plans) == 0 && previewProblem != "" {
-		return "", previewProblem
+		return "", previewProblem, 0
 	}
 
 	sort.SliceStable(plans, func(i, j int) bool { return plans[i].Priority > plans[j].Priority })
@@ -157,9 +169,18 @@ func (c *Client) ClaimOfferedPlans(ctx context.Context, jwt, mid string) (string
 			owned[id] = true
 		}
 	}
+	// holdUntil is the latest ends_at among plans the account owns when this
+	// call returns. An Account that already holds a campaign plan has nothing
+	// left to poll for until that plan expires, and polling it anyway costs the
+	// Origin three requests per tick per Account for the whole window (the
+	// reference client holds until ends_at for exactly this reason).
+	var holdUntil int64
 	var claimed, problems, skipped []string
 	for _, p := range plans {
 		if owned[strings.ToLower(p.PlanID)] {
+			if p.EndsAt > holdUntil {
+				holdUntil = p.EndsAt
+			}
 			if p.Name == "" {
 				p.Name = p.PlanID
 			}
@@ -170,15 +191,18 @@ func (c *Client) ClaimOfferedPlans(ctx context.Context, jwt, mid string) (string
 			problems = append(problems, err.Error())
 			continue
 		}
+		if p.EndsAt > holdUntil {
+			holdUntil = p.EndsAt
+		}
 		if p.Name == "" {
 			p.Name = p.PlanID
 		}
 		claimed = append(claimed, p.Name)
 	}
 	if len(claimed) == 0 && len(problems) == 0 && len(skipped) > 0 {
-		return "", "already have: " + strings.Join(skipped, ", ")
+		return "", "already have: " + strings.Join(skipped, ", "), holdUntil
 	}
-	return strings.Join(claimed, ", "), strings.Join(problems, "; ")
+	return strings.Join(claimed, ", "), strings.Join(problems, "; "), holdUntil
 }
 
 // claimPlan: captcha → billing/claim; on 3007

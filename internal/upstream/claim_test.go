@@ -870,3 +870,85 @@ func TestBothFacesEmptyReportsThePreviewProblem(t *testing.T) {
 		t.Errorf("problems = %q, want the preview's own failure surfaced", problems)
 	}
 }
+
+// TestClaimReportsTheHoldHorizon — an Account that owns a campaign plan must
+// report when that plan ends, so the tick can stop asking.
+//
+// The reference client holds until ends_at after a successful claim
+// (scheduler.ts:151); without the horizon here the tick keeps polling an
+// Account that has nothing left to win.
+func TestClaimReportsTheHoldHorizon(t *testing.T) {
+	const endsAt = 1794790800
+	c, _ := newStub(t, func(path string, body map[string]any) (int, string) {
+		switch {
+		case strings.HasSuffix(path, "/billing/preview"):
+			return 200, `{"code":0,"data":{"plans":[
+				{"plan_id":"wk","name":"weekend","priority":9,"ends_at":1794790800}
+			]}}`
+		case strings.HasSuffix(path, balancePath):
+			return 200, `{"code":0,"data":{"plans":[]}}`
+		case strings.HasSuffix(path, "/billing/claim"):
+			return 200, `{"code":0,"data":{"plan":{"plan_id":"wk"}}}`
+		}
+		return 0, ""
+	})
+
+	_, _, hold := c.ClaimOfferedPlansWithHold(context.Background(), "jwt.test", "mid-test")
+
+	if hold != endsAt {
+		t.Fatalf("hold = %d, want %d (the claimed plan's ends_at)", hold, endsAt)
+	}
+}
+
+// TestClaimAlreadyHeldPlanStillReportsItsWindow — the already-own path must
+// report the horizon too: that is the case the tick wastes the most on, since
+// an owned plan is re-offered every tick for the whole campaign.
+func TestClaimAlreadyHeldPlanStillReportsItsWindow(t *testing.T) {
+	const endsAt = 1794790800
+	c, stub := newStub(t, func(path string, body map[string]any) (int, string) {
+		switch {
+		case strings.HasSuffix(path, "/billing/preview"):
+			return 200, `{"code":0,"data":{"plans":[
+				{"plan_id":"wk","name":"weekend","priority":9,"ends_at":1794790800}
+			]}}`
+		case strings.HasSuffix(path, balancePath):
+			return 200, `{"code":0,"data":{"plans":[{"plan_id":"wk"}]}}`
+		}
+		return 0, ""
+	})
+
+	claimed, problems, hold := c.ClaimOfferedPlansWithHold(context.Background(), "jwt.test", "mid-test")
+
+	if len(stub.callsTo("/billing/claim")) != 0 {
+		t.Fatal("claimed an owned plan")
+	}
+	if !strings.HasPrefix(problems, "already have:") {
+		t.Fatalf("problems = %q, want already have:", problems)
+	}
+	if claimed != "" {
+		t.Fatalf("claimed = %q, want empty", claimed)
+	}
+	if hold != endsAt {
+		t.Fatalf("hold = %d, want %d", hold, endsAt)
+	}
+}
+
+// TestClaimHoldIsZeroWithoutAnEndsAt — no window on the wire means no horizon,
+// so the tick keeps its normal cadence rather than inventing one.
+func TestClaimHoldIsZeroWithoutAnEndsAt(t *testing.T) {
+	c, _ := newStub(t, func(path string, body map[string]any) (int, string) {
+		switch {
+		case strings.HasSuffix(path, "/billing/preview"):
+			return 200, `{"code":0,"data":{"plans":[{"plan_id":"p","name":"p","priority":1}]}}`
+		case strings.HasSuffix(path, balancePath):
+			return 200, `{"code":0,"data":{"plans":[]}}`
+		case strings.HasSuffix(path, "/billing/claim"):
+			return 200, `{"code":0,"data":{"plan":{"plan_id":"p"}}}`
+		}
+		return 0, ""
+	})
+
+	if _, _, hold := c.ClaimOfferedPlansWithHold(context.Background(), "jwt.test", "mid-test"); hold != 0 {
+		t.Fatalf("hold = %d, want 0 when no face carried ends_at", hold)
+	}
+}
