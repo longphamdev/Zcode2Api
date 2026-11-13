@@ -22,7 +22,6 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
-	"strconv"
 	"strings"
 
 	"zcode2api/internal/config"
@@ -102,21 +101,29 @@ func parseMarketingDeliveries(deliveries []marketingDelivery) []offeredPlan {
 	var plans []offeredPlan
 	seen := map[string]bool{}
 	for _, d := range deliveries {
+		// Enrichment spans the WHOLE delivery, not one host's background: a
+		// campaign may carry the plan object in the popup while the button sits
+		// on the banner, and scoping the walk per host would leave that button
+		// at priority 0 — losing the ranking against other offered plans.
+		richByID := map[string]offeredPlan{}
+		var rich []offeredPlan
+		for _, host := range []*marketingNode{d.Banner, d.Popup} {
+			if host == nil || len(host.Background) == 0 {
+				continue
+			}
+			var bg any
+			if json.Unmarshal(host.Background, &bg) == nil {
+				collectZcodePlans(bg, &rich, 0)
+			}
+		}
+		for _, p := range rich {
+			if _, exists := richByID[p.PlanID]; !exists {
+				richByID[p.PlanID] = p
+			}
+		}
 		for _, host := range []*marketingNode{d.Banner, d.Popup} {
 			if host == nil {
 				continue
-			}
-			// Enrichment: every zcode_plan object inside this banner/popup.
-			var rich []offeredPlan
-			if len(host.Background) > 0 {
-				var bg any
-				if json.Unmarshal(host.Background, &bg) == nil {
-					collectZcodePlans(bg, &rich, 0)
-				}
-			}
-			richByID := map[string]offeredPlan{}
-			for _, p := range rich {
-				richByID[p.PlanID] = p
 			}
 			for _, btn := range host.Buttons {
 				if btn.Action == nil || btn.Action.Type != "claim_zcode_plan" {
@@ -149,11 +156,16 @@ func (c *Client) marketingPlans(ctx context.Context, jwt, mid string) []offeredP
 	if strings.TrimSpace(mid) == "" {
 		return nil // marketing/touch requires a device id
 	}
-	seq := c.marketingSeq.Add(1) - 1
-	u := config.OriginBaseURL + "/api/v1/marketing/touch?seq=" + strconv.FormatUint(seq, 10)
+	// The reference builds a fresh client each poll, so the wire value is 0
+	// every time. A process-global counter that only grows would ask for a
+	// snapshot position belonging to a different device.
+	u := config.OriginBaseURL + "/api/v1/marketing/touch?seq=0"
+	// The marketing plane is locale-targeted: a campaign distributed to the
+	// zh-CN audience is not returned to an en-US caller, and the failure is a
+	// 200 with empty deliveries — indistinguishable from "no campaign".
 	headers := http.Header{}
 	headers.Set("X-Device-Mid", mid)
-	headers.Set("X-Client-Language", "en-US")
+	headers.Set("X-Client-Language", "zh-CN")
 	headers.Set("X-ZCode-App-Version", config.BillingClientVersion)
 	if jwt != "" {
 		headers.Set("Authorization", "Bearer "+jwt)

@@ -94,13 +94,14 @@ func (c *Client) postEvent(ctx context.Context, jwt, element, userID, mid string
 // this (no activation events — those belong to the warm admission flow).
 func (c *Client) ClaimOfferedPlans(ctx context.Context, jwt, mid string) (string, string) {
 	base := config.OriginBaseURL + "/api/v1/zcode-plan"
+	// The preview is one face and the banner is the other. A preview that fails
+	// must NOT end the walk: the reference client degrades a 404 to an empty
+	// list precisely so the banner is still read, and a campaign is most likely
+	// to be banner-only exactly when the preview is dark (pre-launch, or a
+	// parameter error). Only when BOTH faces come back empty is there nothing
+	// to do.
+	previewProblem := ""
 	status, raw, err := c.getJSON(ctx, http.MethodGet, base+"/billing/preview?app_version="+config.BillingClientVersion+"&platform="+config.ClientPlatform, jwt, mid, nil, nil)
-	if err != nil {
-		return "", "preview: " + err.Error()
-	}
-	if status != 200 {
-		return "", fmt.Sprintf("preview HTTP %d: %s", status, BodySnip(raw, 120))
-	}
 	var pw struct {
 		Code int `json:"code"`
 		Data struct {
@@ -111,8 +112,13 @@ func (c *Client) ClaimOfferedPlans(ctx context.Context, jwt, mid string) (string
 			} `json:"plans"`
 		} `json:"data"`
 	}
-	if json.Unmarshal(raw, &pw) != nil || pw.Code != 0 {
-		return "", fmt.Sprintf("preview code %d", pw.Code)
+	switch {
+	case err != nil:
+		previewProblem = "preview: " + err.Error()
+	case status < 200 || status >= 300:
+		previewProblem = fmt.Sprintf("preview HTTP %d: %s", status, BodySnip(raw, 120))
+	case json.Unmarshal(raw, &pw) != nil || pw.Code != 0:
+		previewProblem = fmt.Sprintf("preview code %d", pw.Code)
 	}
 
 	// The preview is one of two faces. A campaign may be distributed only on the
@@ -137,6 +143,11 @@ func (c *Client) ClaimOfferedPlans(ctx context.Context, jwt, mid string) (string
 		}
 		seen[p.PlanID] = true
 		plans = append(plans, p)
+	}
+	// Neither face offered anything. If the preview was the reason, say so
+	// rather than reporting a clean "nothing offered".
+	if len(plans) == 0 && previewProblem != "" {
+		return "", previewProblem
 	}
 
 	sort.SliceStable(plans, func(i, j int) bool { return plans[i].Priority > plans[j].Priority })

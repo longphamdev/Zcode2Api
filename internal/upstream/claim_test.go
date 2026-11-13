@@ -797,3 +797,76 @@ func TestBannerWithoutPlanObjectStillOffers(t *testing.T) {
 		t.Errorf("claim POSTed %d times, want 1", len(claims))
 	}
 }
+
+// TestPreviewFailureStillReadsTheBanner — the same class of bug as the banner
+// gap itself, one layer up.
+//
+// The banner is most likely to be the only face carrying a campaign exactly
+// when the preview is dark: pre-launch (404), or a parameter error (3001). If a
+// failed preview ended the walk, those campaigns would stay invisible — which is
+// what this did before, even after the banner face was added.
+func TestPreviewFailureStillReadsTheBanner(t *testing.T) {
+	for _, c := range []struct {
+		name         string
+		previewCode  int
+		previewBody  string
+		wantReadable bool
+	}{
+		{"preview 404", 404, `{"code":404,"msg":"not deployed"}`, true},
+		{"preview 3001 parameter error", 200, `{"code":3001,"msg":"parameter error"}`, true},
+		{"preview 500", 500, `{"code":500}`, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			// Assert the banner is actually consulted, which is the behaviour
+			// that matters: the offer then flows through normal claiming.
+			srv, stub := newStub(t, func(path string, _ map[string]any) (int, string) {
+				switch {
+				case strings.HasSuffix(path, "/billing/preview"):
+					return c.previewCode, c.previewBody
+				case strings.HasSuffix(path, "/marketing/touch"):
+					return 200, bannerBody("banner-plan", "Banner Plan", 100)
+				case strings.HasSuffix(path, balancePath):
+					return 200, `{"code":0,"data":{"plans":[]}}`
+				case strings.HasSuffix(path, "/billing/claim"):
+					return 200, `{"code":0,"data":{"plan":{"plan_id":"banner-plan"}}}`
+				}
+				return 0, ""
+			})
+
+			claimed, problems := srv.ClaimOfferedPlans(context.Background(), "jwt", "mid")
+			if n := len(stub.callsTo("/marketing/touch")); n != 1 {
+				t.Fatalf("marketing/touch called %d times, want 1 — a failed preview must not "+
+					"end the walk before the banner is read", n)
+			}
+			if problems != "" {
+				t.Errorf("problems = %q, want none: the banner offered a claimable plan", problems)
+			}
+			if !strings.Contains(claimed, "Banner Plan") {
+				t.Errorf("claimed = %q, want the banner plan", claimed)
+			}
+		})
+	}
+}
+
+// TestBothFacesEmptyReportsThePreviewProblem — when neither face offers
+// anything AND the preview failed, the preview's reason must surface. Reporting
+// a clean "nothing offered" there would hide an Origin problem.
+func TestBothFacesEmptyReportsThePreviewProblem(t *testing.T) {
+	c, _ := newStub(t, func(path string, _ map[string]any) (int, string) {
+		switch {
+		case strings.HasSuffix(path, "/billing/preview"):
+			return 403, `{"code":3012,"msg":"blocked"}`
+		case strings.HasSuffix(path, "/marketing/touch"):
+			return 200, `{"code":0,"data":{"deliveries":[]}}`
+		}
+		return 0, ""
+	})
+
+	claimed, problems := c.ClaimOfferedPlans(context.Background(), "jwt", "mid")
+	if claimed != "" {
+		t.Errorf("claimed = %q, want empty", claimed)
+	}
+	if !strings.Contains(problems, "403") {
+		t.Errorf("problems = %q, want the preview's own failure surfaced", problems)
+	}
+}
