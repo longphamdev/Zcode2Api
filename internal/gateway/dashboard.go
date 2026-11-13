@@ -320,8 +320,12 @@ func (s *Server) apiAccountsClaimAll(w http.ResponseWriter, r *http.Request) {
 	var nDone atomic.Int32
 	s.forEachAccount(work, n, func(a store.Account) {
 		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Minute)
-		claimed, problems := s.up.ClaimOfferedPlans(ctx, a.JWT, a.DeviceMid)
+		claimed, problems, hold := s.up.ClaimOfferedPlansWithHold(ctx, a.JWT, a.DeviceMid)
 		cancel()
+		// A manual win must silence the tick exactly like an automatic one —
+		// otherwise the operator claims by hand and the fleet still polls that
+		// Account every five minutes to be told it already has the plan.
+		s.armClaimHold(a.ID, hold)
 		logClaim("all", a.ID, a.JWT, claimed, problems)
 		ok := claimed != "" || strings.HasPrefix(problems, "already have:")
 		detail := claimed
@@ -354,8 +358,9 @@ func (s *Server) apiAccountsClaimOne(w http.ResponseWriter, r *http.Request) {
 		}
 		log.Printf("[claim] one #%d %s start", a.ID, maskJWT(a.JWT))
 		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Minute)
-		claimed, problems := s.up.ClaimOfferedPlans(ctx, a.JWT, a.DeviceMid)
+		claimed, problems, hold := s.up.ClaimOfferedPlansWithHold(ctx, a.JWT, a.DeviceMid)
 		cancel()
+		s.armClaimHold(a.ID, hold)
 		logClaim("one", a.ID, a.JWT, claimed, problems)
 		msg := claimed
 		if msg == "" {

@@ -199,6 +199,14 @@ func (c *Client) ClaimOfferedPlansWithHold(ctx context.Context, jwt, mid string)
 		}
 		claimed = append(claimed, p.Name)
 	}
+	// An unfinished offer is not a reason to stop polling. Holding on the
+	// strength of the plans that DID resolve would silence the retry of a plan
+	// that failed — an owned plan A with a long window would suppress the
+	// retry of a claimable plan B for up to the cap, which is the opposite of
+	// what a limited-quota campaign wants. Any problem clears the horizon.
+	if len(problems) > 0 {
+		holdUntil = 0
+	}
 	if len(claimed) == 0 && len(problems) == 0 && len(skipped) > 0 {
 		return "", "already have: " + strings.Join(skipped, ", "), holdUntil
 	}

@@ -977,3 +977,67 @@ func TestBannerCarriesEndsAt(t *testing.T) {
 		t.Fatalf("Priority = %d, want 101", plans[0].Priority)
 	}
 }
+
+// TestPartialFailureClearsTheHold — an unfinished offer must not be silenced by
+// a finished one.
+//
+// Found by review. A plan that is already owned contributes its ends_at to the
+// horizon; if a second, claimable plan then fails, holding anyway would stop
+// the tick from ever retrying that failure — for up to the cap. An owned plan A
+// would suppress the retry of a claimable plan B, which is exactly backwards for
+// a quota-limited campaign.
+func TestPartialFailureClearsTheHold(t *testing.T) {
+	c, _ := newStub(t, func(path string, body map[string]any) (int, string) {
+		switch {
+		case strings.HasSuffix(path, "/billing/preview"):
+			return 200, `{"code":0,"data":{"plans":[
+				{"plan_id":"owned-a","name":"A","priority":99,"ends_at":1894790800},
+				{"plan_id":"claimable-b","name":"B","priority":50,"ends_at":1894790800}
+			]}}`
+		case strings.HasSuffix(path, balancePath):
+			// A is owned already; B is not.
+			return 200, `{"code":0,"data":{"plans":[{"plan_id":"owned-a"}]}}`
+		case strings.HasSuffix(path, "/billing/claim"):
+			return 500, `{"code":500,"msg":"boom"}`
+		}
+		return 0, ""
+	})
+
+	claimed, problems, hold := c.ClaimOfferedPlansWithHold(context.Background(), "jwt.test", "mid-test")
+
+	if claimed != "" {
+		t.Fatalf("claimed = %q, want empty", claimed)
+	}
+	if problems == "" {
+		t.Fatal("no problem reported for the failed claim")
+	}
+	if hold != 0 {
+		t.Fatalf("hold = %d, want 0 — an unfinished offer must keep the retry alive", hold)
+	}
+}
+
+// TestAllOwnedStillHolds — the pure owned case must still hold: that is the
+// waste the horizon exists to remove.
+func TestAllOwnedStillHolds(t *testing.T) {
+	const endsAt = 1894790800
+	c, _ := newStub(t, func(path string, body map[string]any) (int, string) {
+		switch {
+		case strings.HasSuffix(path, "/billing/preview"):
+			return 200, `{"code":0,"data":{"plans":[
+				{"plan_id":"owned-a","name":"A","priority":99,"ends_at":1894790800}
+			]}}`
+		case strings.HasSuffix(path, balancePath):
+			return 200, `{"code":0,"data":{"plans":[{"plan_id":"owned-a"}]}}`
+		}
+		return 0, ""
+	})
+
+	_, problems, hold := c.ClaimOfferedPlansWithHold(context.Background(), "jwt.test", "mid-test")
+
+	if !strings.HasPrefix(problems, "already have:") {
+		t.Fatalf("problems = %q", problems)
+	}
+	if hold != endsAt {
+		t.Fatalf("hold = %d, want %d — nothing is pending, so holding is right", hold, endsAt)
+	}
+}

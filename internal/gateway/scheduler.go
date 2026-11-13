@@ -75,25 +75,13 @@ func (s *Server) claimDueAccounts() {
 		// Without this the tick keeps asking the Origin for an Account that
 		// holds the plan — three requests every five minutes, all day, to be
 		// told "already have".
-		holdKey := "claim_hold_" + strconv.FormatInt(a.ID, 10)
-		if until, _ := strconv.ParseInt(s.store.Setting(holdKey, "0"), 10, 64); until > now {
+		if s.claimHeldUntil(a.ID) > now {
 			continue
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 		claimed, problems, hold := s.up.ClaimOfferedPlansWithHold(ctx, a.JWT, a.DeviceMid)
 		cancel()
-		if hold > 0 {
-			// Capped, deliberately unlike the reference client. Its success
-			// hold is the raw ends_at, so a long plan stops its poll for that
-			// whole term; here a single far-future ends_at would switch the
-			// claim tick off for every future campaign and leave no trace.
-			// A day's cap still removes the 288-polls-a-day waste while
-			// guaranteeing the tick re-asks soon enough to catch a new one.
-			if maxHold := now + int64((24 * time.Hour).Seconds()); hold > maxHold {
-				hold = maxHold
-			}
-			s.store.SetSetting(holdKey, strconv.FormatInt(hold, 10))
-		}
+		s.armClaimHold(a.ID, hold)
 		if claimed != "" || (problems != "" && !strings.HasPrefix(problems, "already have:")) {
 			log.Printf("[claim-tick] %s claimed=%q problems=%q hold=%d", maskJWT(a.JWT), claimed, problems, hold)
 		}
@@ -135,4 +123,39 @@ func (s *Server) quotaMonitorLoop() {
 			log.Printf("[quota-monitor] checked=%d expired=%d", checked, dropped)
 		}
 	}
+}
+
+// claimHoldKey is the settings key holding an Account's claim horizon.
+func claimHoldKey(id int64) string { return "claim_hold_" + strconv.FormatInt(id, 10) }
+
+// claimHeldUntil reports the horizon already stored for an Account (0 when
+// none). An unparseable or absent value reads as 0 — a bad setting must fail
+// open and let the tick ask, never silently switch claiming off.
+func (s *Server) claimHeldUntil(id int64) int64 {
+	until, err := strconv.ParseInt(s.store.Setting(claimHoldKey(id), "0"), 10, 64)
+	if err != nil {
+		return 0
+	}
+	return until
+}
+
+// armClaimHold stores the horizon a claim pass reported, capped.
+//
+// The cap is deliberately unlike the reference client, whose success hold is
+// the raw ends_at so a long plan stops its poll for the whole term. Here one
+// far-future ends_at would switch the claim tick off for every future campaign
+// with no trace. A day still removes the 288-poll-a-day waste and re-asks soon
+// enough to catch a new campaign.
+//
+// Both the tick and the manual claim call this: a hand-won campaign must
+// silence the tick exactly like an automatic one.
+func (s *Server) armClaimHold(id int64, hold int64) {
+	if hold <= 0 {
+		return
+	}
+	now := time.Now().Unix()
+	if maxHold := now + int64((24 * time.Hour).Seconds()); hold > maxHold {
+		hold = maxHold
+	}
+	s.store.SetSetting(claimHoldKey(id), strconv.FormatInt(hold, 10))
 }
