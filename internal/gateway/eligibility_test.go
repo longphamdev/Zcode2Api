@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"database/sql"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -160,6 +161,78 @@ func TestAccountEligibilityReasons(t *testing.T) {
 	}
 }
 
+// Every comparison in one decision must be against the caller's instant. The
+// quota helpers used to call time.Now() themselves, so a decision taken at a
+// clock the test controls would read the wall clock instead: period_end judged
+// against a different second than the marker and the cooldown, and the answer
+// depended on when the test ran. A clock two days behind the wall clock makes
+// that divergence unmissable rather than a microsecond race.
+func TestAccountEligibilityUsesTheCallersClock(t *testing.T) {
+	// A fixed instant, deliberately far from time.Now() so a helper reading the
+	// wall clock cannot coincidentally agree.
+	now := time.Date(2001, 2, 3, 4, 5, 6, 0, time.UTC)
+	nowUnix := now.Unix()
+	spentAt := func(pe int64) string {
+		return fmt.Sprintf(`[{"name":"GLM-5.3","limit":10,"remaining":0,"period_end":%d}]`, pe)
+	}
+
+	cases := []struct {
+		name   string
+		acc    store.Account
+		dead   map[string]int64
+		want   eligibilityReason
+		wantAt int64
+	}{
+		{
+			// As of the caller's clock this period ended an hour ago: a refill.
+			// Against the wall clock (2026) it also ended, so only the deadline
+			// arms below can tell the two clocks apart.
+			name: "quota spent, period ends an hour after the callers now",
+			acc:  store.Account{ID: 1, QuotaJSON: spentAt(nowUnix + 3600)},
+			want: ineligibleQuotaSpent,
+			// The wait must be measured from now, not from a wall clock that is
+			// decades later and would read this period as long past.
+			wantAt: nowUnix + 3600,
+		},
+		{
+			// No period_end: the 24-hour fallback is now+86400. A helper reading
+			// the wall clock reports a deadline decades away instead.
+			name:   "quota spent, no period_end, the fallback is from the callers now",
+			acc:    store.Account{ID: 1, QuotaJSON: `[{"name":"GLM-5.3","limit":10,"remaining":0}]`},
+			want:   ineligibleQuotaSpent,
+			wantAt: nowUnix + 86400,
+		},
+		{
+			// A cooling Account whose marker is live as of the caller's clock.
+			name:   "cooling as of the callers now",
+			acc:    store.Account{ID: 1, CoolingUntil: nowUnix + 600},
+			want:   ineligibleUntil,
+			wantAt: nowUnix + 600,
+		},
+		{
+			// The marker is live as of the caller's clock and long past by the
+			// wall clock. Reading the wall clock would call this Account eligible.
+			name:   "a marker live as of the callers now",
+			acc:    store.Account{ID: 1},
+			dead:   map[string]int64{"1:glm53": nowUnix + 600},
+			want:   ineligibleUntil,
+			wantAt: nowUnix + 600,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := accountEligibility(c.acc, "GLM-5.3", c.dead, now)
+			if got.reason != c.want {
+				t.Fatalf("reason = %v, want %v (a helper read the wall clock, not now)", got.reason, c.want)
+			}
+			if got.until.Unix() != c.wantAt {
+				t.Errorf("until = %d, want %d (deadline measured from the callers now)", got.until.Unix(), c.wantAt)
+			}
+		})
+	}
+}
+
 // A model-dead marker for a different model says nothing about this one.
 func TestAccountEligibilityIgnoresOtherModelsMarkers(t *testing.T) {
 	now := time.Now()
@@ -280,4 +353,101 @@ func TestPickExceptDoesNotBenchForOtherReasons(t *testing.T) {
 			t.Errorf("marker expiry = %d, want %d — benching overwrote a live marker", got, wantUntil)
 		}
 	})
+}
+
+// pickExcept judges the sticky Account first, and when it refuses, meets it a
+// second time in the rotation — against the same snapshot. The second verdict
+// adds nothing and re-runs MarkDead for a spent Account.
+//
+// The row left behind is identical either way, because the bench write is an
+// upsert of the same expiry, so the state cannot tell the two apart. Only the
+// number of writes can: audit triggers on dead_until, read through a second
+// connection, count them.
+func TestPickExceptJudgesTheStickyAccountOnce(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "t.db")
+	db, err := store.OpenStore(path)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	periodEnd := time.Now().Add(24 * time.Hour).Unix()
+	spent, err := db.Add("jwt.spent", "spent")
+	if err != nil {
+		t.Fatalf("add spent: %v", err)
+	}
+	if err := db.UpdateQuota(spent.ID, store.Quota{
+		Remaining: 0, Limit: 10,
+		Entitlements: []map[string]any{{
+			"name": "GLM-5.3", "limit": 10, "remaining": 0, "period_end": periodEnd,
+		}},
+	}); err != nil {
+		t.Fatalf("set quota: %v", err)
+	}
+	healthy, err := db.Add("jwt.healthy", "healthy")
+	if err != nil {
+		t.Fatalf("add healthy: %v", err)
+	}
+	if err := db.UpdateQuota(healthy.ID, store.Quota{
+		Remaining: 10, Limit: 10,
+		Entitlements: []map[string]any{{"name": "GLM-5.3", "limit": 10, "remaining": 10}},
+	}); err != nil {
+		t.Fatalf("set quota: %v", err)
+	}
+
+	// A separate connection, so the audit tables are not part of the Store's own
+	// schema and the counter is not written through it.
+	audit, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open audit connection: %v", err)
+	}
+	t.Cleanup(func() { _ = audit.Close() })
+	for _, stmt := range []string{
+		`CREATE TABLE IF NOT EXISTS dead_writes (n INTEGER)`,
+		`DELETE FROM dead_writes`,
+		`INSERT INTO dead_writes VALUES (0)`,
+		`DROP TRIGGER IF EXISTS count_dead_insert`,
+		`DROP TRIGGER IF EXISTS count_dead_update`,
+		`CREATE TRIGGER count_dead_insert AFTER INSERT ON dead_until BEGIN UPDATE dead_writes SET n = n + 1; END`,
+		`CREATE TRIGGER count_dead_update AFTER UPDATE ON dead_until BEGIN UPDATE dead_writes SET n = n + 1; END`,
+	} {
+		if _, err := audit.Exec(stmt); err != nil {
+			t.Fatalf("audit setup %q: %v", stmt, err)
+		}
+	}
+
+	srv := &Server{
+		store:     db,
+		catalog:   NewCatalog(nil),
+		stickyAcc: map[string]int64{},
+		quota1005: map[string]int{},
+		chatOK:    map[int64]time.Time{},
+		cfg:       config.Config{RequestHold: time.Minute, AccountMaxTry: 1},
+	}
+	// The spent Account is the sticky one, so the walk judges it first. Prime the
+	// rotation cursor so the rotation order starts AT it too: without that, the
+	// healthy Account comes first and the double judgement never happens, which
+	// is how this test could pass while the bug was present.
+	srv.stickyAcc["glm53"] = spent.ID
+	db.Rotate("m:glm53", 2)
+
+	picked, err := srv.pickExcept("GLM-5.3", nil)
+	if err != nil {
+		t.Fatalf("pickExcept: %v", err)
+	}
+	if picked == nil || picked.ID != healthy.ID {
+		t.Fatalf("picked %+v, want the healthy Account %d as the fallback", picked, healthy.ID)
+	}
+
+	var writes int
+	if err := audit.QueryRow(`SELECT n FROM dead_writes`).Scan(&writes); err != nil {
+		t.Fatalf("read audit counter: %v", err)
+	}
+	if writes != 1 {
+		t.Errorf("the spent Account was benched %d times in one walk, want exactly 1; "+
+			"the sticky Account was judged twice against the same snapshot", writes)
+	}
+	if got := db.DeadUntil()[fmt.Sprintf("%d:glm53", spent.ID)]; got != periodEnd {
+		t.Errorf("bench expiry = %d, want the quota period end %d", got, periodEnd)
+	}
 }
