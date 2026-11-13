@@ -66,10 +66,15 @@ func TestUsageScannerAbsentFieldDoesNotClobber(t *testing.T) {
 }
 
 // The origin sends exactly one message_delta carrying cumulative totals, so the
-// scanner assigns rather than accumulates. Assert it: a single delta reports
-// 151 output tokens, not double that.
+// scanner assigns rather than accumulates. Replay several cumulative snapshots
+// and assert the last one wins: an accumulating implementation would report the
+// sum (16+40 output tokens), which is the failure this pins.
 func TestUsageScannerTreatsCountersAsCumulative(t *testing.T) {
-	stream := `data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":16,"output_tokens":151,"cache_read_input_tokens":1344}}` + "\n\n"
+	stream := strings.Join([]string{
+		`data: {"type":"message_delta","delta":{"stop_reason":null},"usage":{"input_tokens":8,"output_tokens":16,"cache_read_input_tokens":1000}}` + "\n\n",
+		`data: {"type":"message_delta","delta":{"stop_reason":null},"usage":{"input_tokens":12,"output_tokens":40,"cache_read_input_tokens":1200}}` + "\n\n",
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":16,"output_tokens":151,"cache_read_input_tokens":1344}}` + "\n\n",
+	}, "")
 
 	var s usageScanner
 	if _, err := s.Write([]byte(stream)); err != nil {
@@ -78,13 +83,40 @@ func TestUsageScannerTreatsCountersAsCumulative(t *testing.T) {
 
 	got := s.Usage()
 	if got.Out != 151 {
-		t.Errorf("Out = %d, want 151 (cumulative snapshot, not accumulated)", got.Out)
+		t.Errorf("Out = %d, want 151 (last cumulative snapshot, not the 207 a running sum would give)", got.Out)
 	}
 	if got.In != 16 {
 		t.Errorf("In = %d, want 16", got.In)
 	}
 	if got.CacheRead != 1344 {
 		t.Errorf("CacheRead = %d, want 1344", got.CacheRead)
+	}
+}
+
+// A present-but-zero counter still overwrites: it is an explicit snapshot value,
+// not an omission. Only an absent field leaves the earlier value intact. Both
+// halves matter, because the origin really does emit input_tokens:0 early in a
+// stream — the danger is an event that repeats 0 later.
+func TestUsageScannerPresentZeroOverwrites(t *testing.T) {
+	stream := strings.Join([]string{
+		`data: {"type":"message_delta","delta":{},"usage":{"input_tokens":42,"output_tokens":9,"cache_read_input_tokens":900}}` + "\n\n",
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":0,"output_tokens":10,"cache_read_input_tokens":0}}` + "\n\n",
+	}, "")
+
+	var s usageScanner
+	if _, err := s.Write([]byte(stream)); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	got := s.Usage()
+	if got.In != 0 {
+		t.Errorf("In = %d, want 0 — an explicit zero is a snapshot value, not an omission", got.In)
+	}
+	if got.CacheRead != 0 {
+		t.Errorf("CacheRead = %d, want 0 — same rule for cache counters", got.CacheRead)
+	}
+	if got.Out != 10 {
+		t.Errorf("Out = %d, want 10", got.Out)
 	}
 }
 

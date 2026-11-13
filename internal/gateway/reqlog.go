@@ -77,8 +77,10 @@ type Usage struct {
 	CacheCreate int
 }
 
-// usageScanner parses Anthropic SSE chunks for usage fields (message_start
-// usage.input_tokens + cache_read/creation; message_delta usage.output_tokens).
+// usageScanner parses Anthropic SSE chunks for usage fields. The origin splits
+// the token triple across events — message_start carries input/output only,
+// message_delta carries the cumulative totals including the cache counters — so
+// each counter is taken from whichever event supplies it.
 type usageScanner struct {
 	buf   bytes.Buffer
 	found Usage
@@ -140,10 +142,10 @@ func (u *usageScanner) Write(p []byte) (int, error) {
 				u.found.CacheCreate = *cacheCreate
 			}
 		}
-		if ev.Usage != nil { // message_delta — cumulative totals incl. cache
+		if ev.Usage != nil { // top-level usage: the cumulative totals
 			apply(ev.Usage.InputTokens, ev.Usage.OutputTokens, ev.Usage.CacheReadInputTokens, ev.Usage.CacheCreationInputTokens)
 		}
-		if ev.Message.Usage != nil { // message_start
+		if ev.Message.Usage != nil { // usage nested in the message object
 			apply(ev.Message.Usage.InputTokens, ev.Message.Usage.OutputTokens, ev.Message.Usage.CacheReadInputTokens, ev.Message.Usage.CacheCreationInputTokens)
 		}
 	}
