@@ -149,8 +149,14 @@ func (s *Server) claimHeldUntil(id int64) int64 {
 //
 // Both the tick and the manual claim call this: a hand-won campaign must
 // silence the tick exactly like an automatic one.
+//
+// A zero or negative horizon CLEARS any stored one rather than being ignored: a
+// pass that reported an unfinished offer must take back the silence an earlier
+// success armed, otherwise a failed retry stays suppressed until the old cap
+// expires.
 func (s *Server) armClaimHold(id int64, hold int64) {
 	if hold <= 0 {
+		s.store.SetSetting(claimHoldKey(id), "0")
 		return
 	}
 	now := time.Now().Unix()

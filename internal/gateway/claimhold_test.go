@@ -52,15 +52,22 @@ func TestArmClaimHoldCapsAtADay(t *testing.T) {
 	}
 }
 
-// A zero horizon means "nothing known" and must not write anything: writing 0
-// would look like a hold that already expired, which is harmless, but skipping
-// the write keeps a manual pass with no offers from touching the store at all.
-func TestArmClaimHoldIgnoresZeroAndNegative(t *testing.T) {
+// A zero or negative horizon CLEARS the stored one.
+//
+// Found by review. An earlier success arms the hold; a later pass that reports
+// an unfinished offer returns 0. Treating 0 as "nothing to do" would leave the
+// old hold armed, so the failed offer stays suppressed until the cap expires —
+// the passage of an unfinished offer must be able to take the silence back.
+func TestArmClaimHoldClearsOnZeroAndNegative(t *testing.T) {
 	s := newHoldServer(t)
 	for _, v := range []int64{0, -1, -1794600000} {
+		s.armClaimHold(1, time.Now().Add(time.Hour).Unix())
+		if s.claimHeldUntil(1) <= time.Now().Unix() {
+			t.Fatalf("precondition failed: hold was not armed")
+		}
 		s.armClaimHold(1, v)
 		if got := s.claimHeldUntil(1); got != 0 {
-			t.Fatalf("armClaimHold(%d) stored %d, want no hold", v, got)
+			t.Fatalf("armClaimHold(%d) left hold=%d, want it cleared", v, got)
 		}
 	}
 }
