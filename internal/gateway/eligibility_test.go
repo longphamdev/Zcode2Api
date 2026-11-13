@@ -16,6 +16,12 @@ func TestAccountEligibilityReasons(t *testing.T) {
 	now := time.Now()
 	nowUnix := now.Unix()
 	coolingUntil := now.Add(5 * time.Minute).Unix()
+	// The quota helpers read the wall clock for period_end, so the fixture is
+	// anchored to it as well.
+	periodEnd := time.Now().Add(48 * time.Hour).Unix()
+	spentUntil := func(pe int64) string {
+		return fmt.Sprintf(`[{"name":"GLM-5.3","limit":10,"remaining":0,"period_end":%d}]`, pe)
+	}
 
 	cases := []struct {
 		name   string
@@ -51,9 +57,10 @@ func TestAccountEligibilityReasons(t *testing.T) {
 		},
 		{
 			// Distinct from ineligibleForever: this reason also benches the Account.
-			name: "quota exhausted",
-			acc:  store.Account{ID: 1, QuotaJSON: `[{"name":"GLM-5.3","limit":10,"remaining":0}]`},
-			want: ineligibleQuotaSpent,
+			name:   "quota exhausted",
+			acc:    store.Account{ID: 1, QuotaJSON: spentUntil(periodEnd)},
+			want:   ineligibleQuotaSpent,
+			wantAt: periodEnd,
 		},
 		{
 			name:   "cooling",
@@ -69,6 +76,38 @@ func TestAccountEligibilityReasons(t *testing.T) {
 			wantAt: nowUnix + 600,
 		},
 		{
+			// Blockers stack: the Account is unusable until the LAST one lapses.
+			// Reporting the marker alone told the walk "back in ten minutes" for an
+			// Account whose cooldown ran another twenty.
+			name:   "marker and cooling: the later one wins",
+			acc:    store.Account{ID: 1, CoolingUntil: now.Add(30 * time.Minute).Unix()},
+			dead:   map[string]int64{"1:glm53": nowUnix + 600},
+			want:   ineligibleUntil,
+			wantAt: now.Add(30 * time.Minute).Unix(),
+		},
+		{
+			name:   "cooling and marker: the later one wins either way",
+			acc:    store.Account{ID: 1, CoolingUntil: coolingUntil},
+			dead:   map[string]int64{"1:glm53": now.Add(30 * time.Minute).Unix()},
+			want:   ineligibleUntil,
+			wantAt: now.Add(30 * time.Minute).Unix(),
+		},
+		{
+			// Spent quota under a cooldown: the reason stays ineligibleUntil so the
+			// caller does not bench, but the wait runs to the quota reset, not to
+			// the end of the cooldown — the Account is still empty then.
+			name:   "cooling and spent quota: wait for the reset",
+			acc:    store.Account{ID: 1, CoolingUntil: coolingUntil, QuotaJSON: spentUntil(periodEnd)},
+			want:   ineligibleUntil,
+			wantAt: periodEnd,
+		},
+		{
+			// A permanent exclusion beats a temporary one: cooling says nothing
+			// about an Account that will never serve this model.
+			name: "cooling with a plan that lacks the model",
+			acc:  store.Account{ID: 1, CoolingUntil: coolingUntil, QuotaJSON: `[{"name":"other","limit":10,"remaining":10}]`},
+			want: ineligibleForever,
+		}, {
 			name: "plan has model, quota remains",
 			acc:  store.Account{ID: 1, QuotaJSON: `[{"name":"GLM-5.3","limit":10,"remaining":3}]`},
 			want: eligibleNow,
@@ -86,7 +125,7 @@ func TestAccountEligibilityReasons(t *testing.T) {
 			if got.reason != c.want {
 				t.Fatalf("reason = %v, want %v", got.reason, c.want)
 			}
-			if c.want == ineligibleUntil && c.wantAt != 0 && got.until.Unix() != c.wantAt {
+			if c.wantAt != 0 && got.until.Unix() != c.wantAt {
 				t.Errorf("until = %d, want %d", got.until.Unix(), c.wantAt)
 			}
 		})
@@ -118,10 +157,11 @@ func TestPickExceptBenchesExhaustedQuota(t *testing.T) {
 	if err != nil {
 		t.Fatalf("add account: %v", err)
 	}
+	periodEnd := time.Now().Add(24 * time.Hour).Unix()
 	if err := db.UpdateQuota(acc.ID, store.Quota{
 		Remaining: 0, Limit: 10,
 		Entitlements: []map[string]any{{
-			"name": "GLM-5.3", "limit": 10, "remaining": 0, "period_end": time.Now().Add(24 * time.Hour).Unix(),
+			"name": "GLM-5.3", "limit": 10, "remaining": 0, "period_end": periodEnd,
 		}},
 	}); err != nil {
 		t.Fatalf("set quota: %v", err)
@@ -141,6 +181,9 @@ func TestPickExceptBenchesExhaustedQuota(t *testing.T) {
 	}
 	if dead := db.DeadSet(); !dead["1:glm53"] {
 		t.Errorf("the exhausted Account was not benched; dead set = %v", dead)
+	}
+	if got := db.DeadUntil()["1:glm53"]; got != periodEnd {
+		t.Errorf("bench expiry = %d, want the quota period end %d", got, periodEnd)
 	}
 }
 

@@ -458,36 +458,41 @@ const (
 	// eligibleNow: the Account can serve this model at this instant.
 	eligibleNow eligibilityReason = iota
 	// ineligibleUntil: it cannot now, but a known instant will change that
-	// (cooling, or a model-scoped dead marker). `until` is always in the future;
-	// a marker that has already lapsed yields eligibleNow instead.
+	// (cooling, or a model-scoped dead marker, possibly alongside spent quota).
+	// `until` is the instant the LAST of those blockers lapses — the Account is
+	// unusable until every one of them has — and is always in the future; a
+	// marker that has already lapsed yields eligibleNow instead.
 	ineligibleUntil
 	// ineligibleForever: nothing about this Account will make it serve this
 	// model — expired, revoked, excluded for the model, or the plan lacks it.
 	ineligibleForever
-	// ineligibleQuotaSpent: the plan carries the model but the quota is gone.
-	// Kept distinct from ineligibleForever because refusing this Account also
-	// benches it, and only this reason should. Folding it into the generic case
-	// made the caller re-derive the condition, which then benched Accounts that
-	// were merely cooling and overwrote live markers.
+	// ineligibleQuotaSpent: the plan carries the model but the quota is gone,
+	// and nothing else blocks the Account. Kept distinct from ineligibleUntil
+	// because refusing this Account also benches it, and only this reason
+	// should: when a cooldown or a live marker is also in place the reason is
+	// ineligibleUntil, so the caller neither benches a merely-cooling Account
+	// nor overwrites a live marker. `until` is the quota period end.
 	ineligibleQuotaSpent
 )
 
 // eligibility is the outcome of accountEligibility.
 type eligibility struct {
 	reason eligibilityReason
-	until  time.Time // meaningful only for ineligibleUntil
+	until  time.Time // when the Account becomes usable; zero for eligibleNow and ineligibleForever
 }
 
 // accountEligibility decides whether an Account can serve a model, and if not,
-// why.
+// why — and when, if the reason is temporary.
 //
 // This is the one place that ladder lives. It used to exist twice — in
 // pickExcept's servable() and again in recoveryAt — and the copies drifted three
 // times: plan exclusion, model-scoped dead markers, and exhausted quota were each
 // honoured by one and missed by the other. Every drift was a live bug.
 //
-// Pure: no store writes, no rotation, no skipping. Those are consequences of
-// choosing, not rules of eligibility, and they stay with the caller.
+// No store writes, no rotation, no skipping: those are consequences of
+// choosing, not rules of eligibility, and they stay with the caller. The quota
+// helpers in upstream read the wall clock for period_end, so `now` governs the
+// marker and cooling comparisons only.
 func accountEligibility(a store.Account, model string, dead map[string]int64, now time.Time) eligibility {
 	nowUnix := now.Unix()
 	mkey := upstream.Norm(model)
@@ -498,25 +503,40 @@ func accountEligibility(a store.Account, model string, dead map[string]int64, no
 	if modelExcluded(a, model) {
 		return eligibility{reason: ineligibleForever} // excluded for this model
 	}
-	// Order matters, and it matches the pre-refactor ladder: a temporary
-	// condition is reported before a permanent one. That keeps the quota arm from
-	// firing — and therefore benching the Account — when the real reason is a
-	// cooldown or a marker that is already in place.
-	if until, ok := dead[fmt.Sprintf("%d:%s", a.ID, mkey)]; ok && until > nowUnix {
-		return eligibility{reason: ineligibleUntil, until: time.Unix(until, 0)}
-	}
-	if a.CoolingUntil > nowUnix {
-		return eligibility{reason: ineligibleUntil, until: time.Unix(a.CoolingUntil, 0)}
-	}
+	// A permanent exclusion beats a temporary one: a cooling Account whose plan
+	// lacks the model never recovers for it, so it must not contribute a
+	// recovery time. Reporting the cooldown first did exactly that.
 	ents := entitlementsOf(a)
+	spent := false
 	if len(ents) > 0 {
 		frac, ok := upstream.FracFromEntitlements(ents, model)
 		if !ok {
 			return eligibility{reason: ineligibleForever} // plan lacks the model
 		}
-		if frac <= 0 {
-			return eligibility{reason: ineligibleQuotaSpent, until: time.Unix(upstream.DeadUntilUnix(ents, model), 0)}
-		}
+		spent = frac <= 0
+	}
+
+	// Temporary blockers stack: the Account is unusable until the LAST of them
+	// lapses. Reporting whichever was checked first told the walk "back in five
+	// minutes" for an Account whose cooldown ran another twenty-five.
+	var until int64
+	blocked := false
+	if u, ok := dead[fmt.Sprintf("%d:%s", a.ID, mkey)]; ok && u > nowUnix {
+		until, blocked = max(until, u), true
+	}
+	if a.CoolingUntil > nowUnix {
+		until, blocked = max(until, a.CoolingUntil), true
+	}
+	if spent {
+		// Without a period_end this is the 24-hour fallback the bench marker
+		// also uses, so the figure the walk reports is the one it will act on.
+		until = max(until, upstream.DeadUntilUnix(ents, model))
+	}
+	switch {
+	case blocked:
+		return eligibility{reason: ineligibleUntil, until: time.Unix(until, 0)}
+	case spent:
+		return eligibility{reason: ineligibleQuotaSpent, until: time.Unix(until, 0)}
 	}
 	return eligibility{reason: eligibleNow}
 }
@@ -547,13 +567,15 @@ func modelExcluded(a store.Account, model string) bool {
 // It reports readyNow when some Account can serve this instant, which is not
 // the same as "nothing to wait for" — a walk that just failed transiently
 // leaves the pool ready-now, and the next pass may succeed.
+// Spent quota is a wait too: the period resets at a known instant, whether or
+// not a walk has benched the Account yet.
 func recoveryAt(accs []store.Account, dead map[string]int64, model string, now time.Time) (recover time.Time, readyNow bool, waiting bool) {
 	var earliest time.Time
 	for _, a := range accs {
 		switch e := accountEligibility(a, model, dead, now); e.reason {
 		case eligibleNow:
 			return time.Time{}, true, false
-		case ineligibleUntil:
+		case ineligibleUntil, ineligibleQuotaSpent:
 			if earliest.IsZero() || e.until.Before(earliest) {
 				earliest = e.until
 			}

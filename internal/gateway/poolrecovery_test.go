@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -175,20 +176,40 @@ func TestRecoveryAtIgnoresOtherModelsDeadMarkers(t *testing.T) {
 }
 
 // An Account whose plan does not include this model can never serve it, so it
-// must not contribute a recovery time — pickExcept already refuses it.
-// A plan that lacks the model means this Account never serves it, whatever its
-// cooling state. No cooling here, so the plan is the only thing that can explain
-// the answer — with a cooldown present the temporary reason is reported first,
-// matching what pickExcept would do.
+// must not contribute a recovery time — pickExcept already refuses it. The
+// cooldown is there so the test fails if the ladder reports the temporary reason
+// before the permanent one: that would advertise a recovery that never comes.
 func TestRecoveryAtIgnoresPlanWithoutModel(t *testing.T) {
 	now := time.Now()
 	accs := []store.Account{{
-		ID:        1,
-		QuotaJSON: `[{"name":"other-model","limit":100,"remaining":100}]`,
+		ID:           1,
+		CoolingUntil: now.Add(10 * time.Minute).Unix(),
+		QuotaJSON:    `[{"name":"other-model","limit":100,"remaining":100}]`,
 	}}
 
 	if until, _, waiting := recoveryAt(accs, nil, "GLM-5.3", now); waiting {
 		t.Errorf("an account whose plan lacks this model never recovers for it; got a wait until %s", until)
+	}
+}
+
+// Spent quota is a wait, not a dead end: the period resets at a known instant.
+// recoveryAt used to read it as hopeless, and only looked right because
+// pickExcept had already benched the Account on the previous pass — the
+// estimate depended on call order, not on the Account's state.
+func TestRecoveryAtWaitsForQuotaReset(t *testing.T) {
+	now := time.Now()
+	periodEnd := now.Add(6 * time.Hour).Unix()
+	accs := []store.Account{{
+		ID:        1,
+		QuotaJSON: fmt.Sprintf(`[{"name":"GLM-5.3","limit":10,"remaining":0,"period_end":%d}]`, periodEnd),
+	}}
+
+	until, _, waiting := recoveryAt(accs, nil, "GLM-5.3", now)
+	if !waiting {
+		t.Fatal("spent quota resets at period_end; that is a wait, not hopeless")
+	}
+	if until.Unix() != periodEnd {
+		t.Errorf("recovery at %d, want the period end %d", until.Unix(), periodEnd)
 	}
 }
 
