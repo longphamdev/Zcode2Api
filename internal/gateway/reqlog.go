@@ -104,36 +104,47 @@ func (u *usageScanner) Write(p []byte) (int, error) {
 		var ev struct {
 			Type  string `json:"type"`
 			Usage *struct {
-				InputTokens              int `json:"input_tokens"`
-				OutputTokens             int `json:"output_tokens"`
-				CacheReadInputTokens     int `json:"cache_read_input_tokens"`
-				CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+				InputTokens              *int `json:"input_tokens"`
+				OutputTokens             *int `json:"output_tokens"`
+				CacheReadInputTokens     *int `json:"cache_read_input_tokens"`
+				CacheCreationInputTokens *int `json:"cache_creation_input_tokens"`
 			} `json:"usage"`
 			Message struct {
 				Usage *struct {
-					InputTokens              int `json:"input_tokens"`
-					CacheReadInputTokens     int `json:"cache_read_input_tokens"`
-					CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+					InputTokens              *int `json:"input_tokens"`
+					OutputTokens             *int `json:"output_tokens"`
+					CacheReadInputTokens     *int `json:"cache_read_input_tokens"`
+					CacheCreationInputTokens *int `json:"cache_creation_input_tokens"`
 				} `json:"usage"`
 			} `json:"message"`
 		}
 		if json.Unmarshal(payload, &ev) != nil {
 			continue
 		}
-		if ev.Usage != nil {
-			if ev.Usage.OutputTokens > 0 {
-				u.found.Out = ev.Usage.OutputTokens
+		// Counters arrive as cumulative snapshots, and different events carry
+		// different subsets: message_start has input/output only, message_delta
+		// adds the cache counters. Assign whichever are present (they are the
+		// latest totals) and leave the rest alone, so an event that omits a
+		// field cannot zero out a value an earlier event reported.
+		apply := func(in, out, cacheRead, cacheCreate *int) {
+			if in != nil {
+				u.found.In = *in
 			}
-			if ev.Usage.InputTokens > 0 {
-				u.found.In = ev.Usage.InputTokens
+			if out != nil {
+				u.found.Out = *out
+			}
+			if cacheRead != nil {
+				u.found.CacheRead = *cacheRead
+			}
+			if cacheCreate != nil {
+				u.found.CacheCreate = *cacheCreate
 			}
 		}
+		if ev.Usage != nil { // message_delta — cumulative totals incl. cache
+			apply(ev.Usage.InputTokens, ev.Usage.OutputTokens, ev.Usage.CacheReadInputTokens, ev.Usage.CacheCreationInputTokens)
+		}
 		if ev.Message.Usage != nil { // message_start
-			if ev.Message.Usage.InputTokens > 0 {
-				u.found.In = ev.Message.Usage.InputTokens
-			}
-			u.found.CacheRead = ev.Message.Usage.CacheReadInputTokens
-			u.found.CacheCreate = ev.Message.Usage.CacheCreationInputTokens
+			apply(ev.Message.Usage.InputTokens, ev.Message.Usage.OutputTokens, ev.Message.Usage.CacheReadInputTokens, ev.Message.Usage.CacheCreationInputTokens)
 		}
 	}
 	return len(p), nil
