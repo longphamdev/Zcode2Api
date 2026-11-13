@@ -358,6 +358,11 @@ func (s *Server) pickExcept(model string, skip map[int64]bool) (*store.Account, 
 	order := append(accs[start:], accs[:start]...)
 	for _, a := range order {
 		a := a
+		if a.ID == stickyID {
+			// Already judged above against this same snapshot; judging it again
+			// re-runs the bench write for a spent Account.
+			continue
+		}
 		if !servable(a) {
 			continue
 		}
