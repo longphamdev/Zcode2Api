@@ -579,6 +579,12 @@ func anthEventToOA(ev string, data map[string]any, id, model string, st *oaStrea
 	case "message_delta":
 		md, _ := data["delta"].(map[string]any)
 		if sr := upstream.Str(md["stop_reason"]); sr != "" {
+			// Only the first stop_reason wins. The origin can send several
+			// message_delta events (only the terminal one normally carries a
+			// reason), and a repeat must not emit a second finish_reason.
+			if st.finished {
+				return nil
+			}
 			fr := oaFinishReason(sr)
 			finish = &fr
 			st.finished = true

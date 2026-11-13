@@ -11,7 +11,12 @@ import (
 // oaFrame is the shape anthEventToOA hands to the SSE writer.
 type oaFrame struct {
 	FinishReason string
-	ToolCalls    []map[string]any
+	// FinishReasonPresent distinguishes "the key is there and null" from "the
+	// key is absent" — a distinction the OpenAI stream schema cares about and
+	// that a plain string field cannot express.
+	FinishReasonPresent bool
+	FinishReasonNull    bool
+	ToolCalls           []map[string]any
 }
 
 // collectFrames drives anthEventToOA over a synthetic Anthropic event stream
@@ -31,8 +36,13 @@ func collectFrames(t *testing.T, sse string) []oaFrame {
 			return
 		}
 		choice, _ := choices[0].(map[string]any)
-		if fr, ok := choice["finish_reason"].(string); ok {
-			f.FinishReason = fr
+		fr, present := choice["finish_reason"]
+		f.FinishReasonPresent = present
+		if fr == nil && present {
+			f.FinishReasonNull = true
+		}
+		if s, ok := fr.(string); ok {
+			f.FinishReason = s
 		}
 		delta, _ := choice["delta"].(map[string]any)
 		if tc, ok := delta["tool_calls"].([]any); ok {
@@ -263,5 +273,114 @@ func TestOAFinishReason(t *testing.T) {
 		if got := oaFinishReason(in); got != want {
 			t.Errorf("oaFinishReason(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// The OpenAI stream schema marks finish_reason required (nullable) on every
+// choice, so content chunks must carry the key with a JSON null — absent is a
+// contract violation that strict clients reject. Table-driven because the
+// assertion is identical for every non-terminal event; only the event differs.
+func TestStreamNonTerminalChunksCarryNullFinishReason(t *testing.T) {
+	cases := []struct {
+		name string
+		sse  string
+	}{
+		{"text delta",
+			`event: content_block_delta` + "\n" + `data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}` + "\n\n"},
+		{"thinking delta",
+			`event: content_block_delta` + "\n" + `data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hmm"}}` + "\n\n"},
+		{"tool_use announcement",
+			`event: content_block_start` + "\n" + `data: {"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"call_a","name":"run_shell"}}` + "\n\n"},
+		{"tool argument delta",
+			`event: content_block_start` + "\n" + `data: {"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"call_a","name":"run_shell"}}` + "\n\n" +
+				`event: content_block_delta` + "\n" + `data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{}"}}` + "\n\n"},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			frames := collectFrames(t, c.sse)
+			if len(frames) == 0 {
+				t.Fatal("no chunks emitted")
+			}
+			for i, f := range frames {
+				if !f.FinishReasonPresent {
+					t.Fatalf("chunk %d is missing the finish_reason key entirely", i)
+				}
+				if !f.FinishReasonNull {
+					t.Errorf("chunk %d finish_reason = %q, want null on a non-terminal chunk", i, f.FinishReason)
+				}
+			}
+		})
+	}
+}
+
+// The terminal chunk carries the real reason, and it must be one the OpenAI
+// enum allows. Builds on oaFinishReason's mapping but checks the wire value.
+func TestStreamTerminalChunkCarriesEnumFinishReason(t *testing.T) {
+	allowed := map[string]bool{
+		"stop": true, "length": true, "tool_calls": true,
+		"content_filter": true, "function_call": true,
+	}
+
+	for _, c := range []struct{ stopReason, want string }{
+		{"end_turn", "stop"},
+		{"max_tokens", "length"},
+		{"tool_use", "tool_calls"},
+	} {
+		sse := `event: message_delta` + "\n" +
+			`data: {"type":"message_delta","delta":{"stop_reason":"` + c.stopReason + `"}}` + "\n\n"
+		frames := collectFrames(t, sse)
+		if len(frames) != 1 {
+			t.Fatalf("%s: got %d chunks, want 1", c.stopReason, len(frames))
+		}
+		got := frames[0]
+		if !got.FinishReasonPresent {
+			t.Fatalf("%s: finish_reason key absent on the terminal chunk", c.stopReason)
+		}
+		if got.FinishReason != c.want {
+			t.Errorf("stop_reason %s -> finish_reason %q, want %q", c.stopReason, got.FinishReason, c.want)
+		}
+		if !allowed[got.FinishReason] {
+			t.Errorf("finish_reason %q is outside the OpenAI enum", got.FinishReason)
+		}
+	}
+}
+
+// The origin can send several message_delta events — the captured fixtures in
+// reqlog_test.go show three. Only the terminal one normally carries a
+// stop_reason, but a repeat must not emit a second finish_reason: the
+// single-reason guarantee is what clients key their turn-ending off.
+func TestStreamEmitsExactlyOneNonNilFinishReason(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		sse  string
+	}{
+		{"one stop_reason", strings.Join([]string{
+			`event: content_block_delta` + "\n" + `data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}` + "\n\n",
+			`event: message_delta` + "\n" + `data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}` + "\n\n",
+			`event: message_stop` + "\n" + `data: {"type":"message_stop"}` + "\n\n",
+		}, "")},
+		{"repeated stop_reason", strings.Join([]string{
+			`event: content_block_delta` + "\n" + `data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}` + "\n\n",
+			`event: message_delta` + "\n" + `data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}` + "\n\n",
+			`event: message_delta` + "\n" + `data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}` + "\n\n",
+			`event: message_stop` + "\n" + `data: {"type":"message_stop"}` + "\n\n",
+		}, "")},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			frames := collectFrames(t, c.sse)
+			nonNil := 0
+			for i, f := range frames {
+				if !f.FinishReasonPresent {
+					t.Fatalf("chunk %d: finish_reason key absent", i)
+				}
+				if f.FinishReason != "" {
+					nonNil++
+				}
+			}
+			if nonNil != 1 {
+				t.Errorf("got %d chunks with a non-null finish_reason, want exactly 1", nonNil)
+			}
+		})
 	}
 }
