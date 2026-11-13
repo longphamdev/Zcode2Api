@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -598,56 +599,140 @@ func TestUnsupportedModelMessageIsBounded(t *testing.T) {
 }
 
 // End-to-end through the real handler: the 404 must come out of the HTTP
-// surface, not just out of the helper. This path needs no origin — the verdict
-// is decided before anything is forwarded — so it can be tested today, without
-// the injectable client that issue #18 will bring.
-func TestChatCompletionsReturns404ForUnknownModel(t *testing.T) {
+// surface, not just out of the helper, on both wire formats, and whether or not
+// holding is enabled. The verdict used to be reached only after the hold cutoff,
+// so REQUEST_HOLD=0 answered 529 for a model that does not exist.
+func TestUnknownModelIs404OnBothWireFormatsRegardlessOfHold(t *testing.T) {
+	cases := []struct {
+		name     string
+		hold     time.Duration
+		path     string
+		handle   func(s *Server, w http.ResponseWriter, r *http.Request)
+		wantType string // the error.type each wire format promises
+	}{
+		{"openai, holding", 10 * time.Minute, "/v1/chat/completions", (*Server).handleChatCompletions, "invalid_request_error"},
+		{"openai, fail-fast", 0, "/v1/chat/completions", (*Server).handleChatCompletions, "invalid_request_error"},
+		{"anthropic, holding", 10 * time.Minute, "/v1/messages", (*Server).handleMessages, "not_found_error"},
+		{"anthropic, fail-fast", 0, "/v1/messages", (*Server).handleMessages, "not_found_error"},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			db, err := store.OpenStore(filepath.Join(t.TempDir(), "t.db"))
+			if err != nil {
+				t.Fatalf("open store: %v", err)
+			}
+			t.Cleanup(func() { _ = db.Close() })
+
+			// One Account whose scanned plan carries only another model.
+			acc, err := db.Add("jwt.a", "a")
+			if err != nil {
+				t.Fatalf("add account: %v", err)
+			}
+			if err := db.UpdateQuota(acc.ID, store.Quota{
+				Remaining: 10, Limit: 10,
+				Entitlements: []map[string]any{
+					{"name": "GLM-5.3", "limit": 10, "remaining": 10},
+				},
+			}); err != nil {
+				t.Fatalf("set quota: %v", err)
+			}
+
+			// A wrong verdict must fail the test, not panic it on a nil Origin.
+			origin := &fakeOrigin{reply: func(int) (*http.Response, error) {
+				t.Error("the Origin must not be asked about a model no plan offers")
+				return nil, errors.New("unreachable")
+			}}
+			srv := &Server{
+				store:     db,
+				catalog:   NewCatalog(nil),
+				origin:    origin,
+				stickyAcc: map[string]int64{},
+				quota1005: map[string]int{},
+				chatOK:    map[int64]time.Time{},
+				cfg:       config.Config{RequestHold: c.hold, AccountMaxTry: 1},
+			}
+
+			req := httptest.NewRequest(http.MethodPost, c.path,
+				strings.NewReader(`{"model":"NO-SUCH-MODEL","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`))
+			rec := httptest.NewRecorder()
+
+			c.handle(srv, rec, req)
+
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404 (body=%s)", rec.Code, rec.Body.String())
+			}
+			var out struct {
+				Error struct {
+					Type string  `json:"type"`
+					Code *string `json:"code"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+				t.Fatalf("body is not JSON: %v (%s)", err, rec.Body.String())
+			}
+			if out.Error.Type != c.wantType {
+				t.Errorf("error.type = %q, want %q", out.Error.Type, c.wantType)
+			}
+			if strings.HasPrefix(c.path, "/v1/chat") && (out.Error.Code == nil || *out.Error.Code != "model_not_found") {
+				t.Errorf("code = %v, want model_not_found", out.Error.Code)
+			}
+		})
+	}
+}
+
+// Fail-fast must stay fail-fast: with holding disabled, a model the pool does
+// offer but cannot serve right now is still an immediate 529, and the
+// Retry-After it carries is the recovery the verdict saw.
+func TestFailFastStillAnswersOverloadForBusyModel(t *testing.T) {
 	db, err := store.OpenStore(filepath.Join(t.TempDir(), "t.db"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
 
-	// One Account whose scanned plan carries only another model.
 	acc, err := db.Add("jwt.a", "a")
 	if err != nil {
 		t.Fatalf("add account: %v", err)
 	}
 	if err := db.UpdateQuota(acc.ID, store.Quota{
 		Remaining: 10, Limit: 10,
-		Entitlements: []map[string]any{
-			{"name": "GLM-5.3", "limit": 10, "remaining": 10},
-		},
+		Entitlements: []map[string]any{{"name": "GLM-5.3", "limit": 10, "remaining": 10}},
 	}); err != nil {
 		t.Fatalf("set quota: %v", err)
 	}
+	// Recovers in two minutes — inside any reasonable hold, but holding is off.
+	db.SetCooling(acc.ID, time.Now().Add(2*time.Minute).Unix())
 
+	origin := &fakeOrigin{reply: func(int) (*http.Response, error) {
+		t.Error("the Origin must not be called for a cooling Account")
+		return nil, errors.New("unreachable")
+	}}
 	srv := &Server{
-		store:   db,
-		catalog: NewCatalog(nil),
-		cfg:     config.Config{GatewayKey: "k", RequestHold: 10 * time.Minute},
+		store:     db,
+		catalog:   NewCatalog(nil),
+		origin:    origin,
+		stickyAcc: map[string]int64{},
+		quota1005: map[string]int{},
+		chatOK:    map[int64]time.Time{},
+		cfg:       config.Config{RequestHold: 0, AccountMaxTry: 1},
 	}
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
-		strings.NewReader(`{"model":"NO-SUCH-MODEL","messages":[{"role":"user","content":"hi"}]}`))
-	req.Header.Set("Authorization", "Bearer k")
+		strings.NewReader(`{"model":"GLM-5.3","messages":[{"role":"user","content":"hi"}]}`))
 	rec := httptest.NewRecorder()
 
+	start := time.Now()
 	srv.handleChatCompletions(rec, req)
-
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("status = %d, want 404 (body=%s)", rec.Code, rec.Body.String())
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("answered after %s; fail-fast must not hold", elapsed.Round(time.Millisecond))
 	}
-	var out struct {
-		Error struct {
-			Code *string `json:"code"`
-		} `json:"error"`
+	if rec.Code != 529 {
+		t.Errorf("status = %d, want 529 (body=%s)", rec.Code, rec.Body.String())
 	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
-		t.Fatalf("body is not JSON: %v (%s)", err, rec.Body.String())
-	}
-	if out.Error.Code == nil || *out.Error.Code != "model_not_found" {
-		t.Errorf("code = %v, want model_not_found", out.Error.Code)
+	ra, err := strconv.Atoi(rec.Header().Get("Retry-After"))
+	if err != nil || ra < 110 || ra > 120 {
+		t.Errorf("Retry-After = %q, want about 120 (the two-minute cooldown)", rec.Header().Get("Retry-After"))
 	}
 }
 

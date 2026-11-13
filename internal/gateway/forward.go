@@ -60,6 +60,7 @@ func (s *Server) routeAnthropic(w http.ResponseWriter, r *http.Request, body []b
 	// re-walk costs nothing — pickExcept refuses without origin traffic.
 	holdUntil := time.Now().Add(s.cfg.RequestHold)
 	dumped := false
+	var recoverAt time.Time // the pool's earliest recovery, from the verdict that ends the walk
 walk:
 	for {
 		skip := map[int64]bool{}
@@ -205,6 +206,23 @@ walk:
 			LogOK(model, maskJWT(acc.JWT), resp.StatusCode, ParseStream(body), 0, time.Since(reqStart), scn.Usage())
 			return
 		}
+		// What the pool can do for this model is decided before the hold is:
+		// a model no Account's plan offers is a missing resource whether or not
+		// holding is enabled. Deciding it after the hold cutoff answered 529 for
+		// it under REQUEST_HOLD=0 — an overload for a model that does not exist.
+		var verdict poolOutcome
+		verdict, recoverAt = s.poolVerdict(model, holdUntil)
+		if verdict == poolUnsupportedModel {
+			// No amount of waiting or retrying will serve it. Say nothing about
+			// the pool's internals.
+			if openai {
+				writeOpenAIModelNotFound(w, model)
+				return
+			}
+			writeAnthropicError(w, http.StatusNotFound, "not_found_error",
+				"model "+clip(model, modelNameLimit)+" is not available")
+			return
+		}
 		if s.cfg.RequestHold <= 0 || time.Now().After(holdUntil) {
 			break walk
 		}
@@ -215,20 +233,8 @@ walk:
 		//
 		// A pool that is ready-now is NOT this case: a walk can fail transiently
 		// with every Account still healthy, and the next pass may succeed.
-		switch s.poolVerdict(model, holdUntil) {
-		case poolHopeless:
+		if verdict == poolHopeless {
 			break walk
-		case poolUnsupportedModel:
-			// No Account's plan offers this model, so no amount of waiting or
-			// retrying will serve it. Report it as a missing resource, not an
-			// overload, and say nothing about the pool's internals.
-			if openai {
-				writeOpenAIModelNotFound(w, model)
-				return
-			}
-			writeAnthropicError(w, http.StatusNotFound, "not_found_error",
-				"model "+clip(model, modelNameLimit)+" is not available")
-			return
 		}
 		select {
 		case <-r.Context().Done():
@@ -238,8 +244,11 @@ walk:
 		}
 	}
 	// Tell the client when to come back. Both wire formats carry the header; the
-	// OpenAI path used to omit it, leaving SDKs to invent their own backoff.
-	retryAfter := s.retryAfterSeconds(model)
+	// OpenAI path used to omit it, leaving SDKs to invent their own backoff. The
+	// figure comes from the same pool snapshot as the verdict that ended the
+	// walk, so the two cannot disagree. Zero when nothing is recoverable: a
+	// client should retry on its own schedule rather than be told a false time.
+	retryAfter := retryAfterFrom(recoverAt, time.Now())
 	if openai {
 		w.Header().Set("Retry-After", retryAfter)
 		writeOpenAIError(w, 529, "Overloaded")
@@ -249,21 +258,6 @@ walk:
 	w.Header().Set("Retry-After", retryAfter)
 	w.WriteHeader(529)
 	w.Write(upstream.OverloadedJSON())
-}
-
-// retryAfterSeconds renders the time until this model's pool recovers as the
-// whole seconds a Retry-After header carries. Zero when nothing is recoverable:
-// a client should retry on its own schedule rather than be told a false time.
-func (s *Server) retryAfterSeconds(model string) string {
-	accs, err := s.store.Accounts()
-	if err != nil {
-		return "0"
-	}
-	recover, _, waiting := recoveryAt(accs, s.store.DeadUntil(), model, time.Now())
-	if !waiting {
-		return "0"
-	}
-	return retryAfterFrom(recover, time.Now())
 }
 
 // retryAfterFrom renders the wait until recover as whole seconds, rounding UP.
@@ -284,17 +278,16 @@ func retryAfterFrom(recover, now time.Time) string {
 	return strconv.Itoa(secs)
 }
 
-// poolVerdict reports what the Pool can do for this model right now.
-// Deliberately cheap: a pool snapshot, no Origin traffic. An unreadable pool
-// reports ready-now, because failing on a store error would answer 529 for a
-// problem the client cannot act on.
-func (s *Server) poolVerdict(model string, holdUntil time.Time) poolOutcome {
+// poolVerdict reports what the Pool can do for this model right now, and when
+// it recovers if it cannot. Deliberately cheap: a pool snapshot, no Origin
+// traffic. An unreadable pool reports ready-now, because failing on a store
+// error would answer 529 for a problem the client cannot act on.
+func (s *Server) poolVerdict(model string, holdUntil time.Time) (poolOutcome, time.Time) {
 	accs, err := s.store.Accounts()
 	if err != nil {
-		return poolReadyNow
+		return poolReadyNow, time.Time{}
 	}
-	outcome, _ := poolAvailability(accs, s.store.DeadUntil(), model, time.Now(), holdUntil)
-	return outcome
+	return poolAvailability(accs, s.store.DeadUntil(), model, time.Now(), holdUntil)
 }
 
 func (s *Server) injectDefaults(body []byte) []byte {
