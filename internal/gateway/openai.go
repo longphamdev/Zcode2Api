@@ -519,7 +519,11 @@ func writeOpenAIFromOriginError(w http.ResponseWriter, status int, raw []byte) {
 		// Not the error shape we expected. The body could be an HTML page from
 		// something in between, or an internal trace — none of which belongs in
 		// a client-facing message. Keep it in the server log for diagnosis and
-		// tell the client something stable.
+		// tell the client something stable. The clip is deliberate here and
+		// absent for a malformed 2xx body (writeOpenAIFromJSON): a refusal's
+		// body is the Origin's own account of why, and an operator needs to see
+		// whether it was a WAF page or a proxy; a garbage success body has
+		// nothing in it to read.
 		log.Printf("[openai] Origin returned %d with an unrecognised error body: %s",
 			status, clip(string(raw), 200))
 	}
@@ -552,14 +556,9 @@ func writeOpenAIFromJSON(w http.ResponseWriter, status int, body io.Reader, id, 
 		return
 	}
 	var doc struct {
-		Content []struct {
-			Type  string          `json:"type"`
-			Text  string          `json:"text"`
-			ID    string          `json:"id"`
-			Name  string          `json:"name"`
-			Input json.RawMessage `json:"input"`
-		} `json:"content"`
-		StopReason string `json:"stop_reason"`
+		Type       string          `json:"type"`
+		Content    json.RawMessage `json:"content"`
+		StopReason string          `json:"stop_reason"`
 	}
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		// A success status with a body that is not a message document: a page
@@ -571,9 +570,28 @@ func writeOpenAIFromJSON(w http.ResponseWriter, status int, body io.Reader, id, 
 		writeOpenAIError(w, http.StatusBadGateway, "origin returned a malformed response")
 		return
 	}
+	// Valid JSON is not yet a reply. `null`, `{}` or an unrelated object decode
+	// into an empty document without error, and used to come out the other side
+	// as a completion with empty content and finish_reason "stop" — a turn the
+	// client believes the model finished. A message document carries its blocks
+	// in a content array; that is the floor, and the one field every real reply
+	// has, tool-use ones included. The type is checked only when present: the
+	// Origin's error document says "error" there, and some replies omit it.
+	var blocks []struct {
+		Type  string          `json:"type"`
+		Text  string          `json:"text"`
+		ID    string          `json:"id"`
+		Name  string          `json:"name"`
+		Input json.RawMessage `json:"input"`
+	}
+	if !startsWithByte(doc.Content, '[') || (doc.Type != "" && doc.Type != "message") || json.Unmarshal(doc.Content, &blocks) != nil {
+		log.Printf("[openai] Origin returned %d with JSON that is not a message document (%d bytes)", status, len(raw))
+		writeOpenAIError(w, http.StatusBadGateway, "origin returned a malformed response")
+		return
+	}
 	text := strings.Builder{}
 	var tools []any
-	for _, b := range doc.Content {
+	for _, b := range blocks {
 		switch b.Type {
 		case "text":
 			text.WriteString(b.Text)
@@ -605,6 +623,12 @@ func writeOpenAIFromJSON(w http.ResponseWriter, status int, body io.Reader, id, 
 			"index": 0, "message": msg, "finish_reason": finish,
 		}},
 	}, scn.Usage()))
+}
+
+// startsWithByte reports whether the first non-space byte of raw is c.
+func startsWithByte(raw []byte, c byte) bool {
+	raw = bytes.TrimSpace(raw)
+	return len(raw) > 0 && raw[0] == c
 }
 
 func collectAnthropic(r io.Reader) (string, []any, error) {

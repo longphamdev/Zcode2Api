@@ -313,6 +313,14 @@ func TestMalformedSuccessBodyIsBadGatewayWithoutEcho(t *testing.T) {
 		{"html page", `<html><body>Service temporarily unavailable<br>nginx/1.24.0</body></html>`},
 		{"truncated json", `{"id":"msg_1","content":[{"type":"text","text":"internal-host-42`},
 		{"plain text", `upstream prematurely closed connection`},
+		// Valid JSON that is not a message document. These decode without error
+		// into an empty document and used to become an empty completion.
+		{"json null", `null`},
+		{"empty object", `{}`},
+		{"empty array", `[]`},
+		{"unrelated object", `{"ok":true,"host":"internal-host-42"}`},
+		{"error document under 200", `{"type":"error","error":{"type":"overloaded_error","message":"internal-host-42"}}`},
+		{"content is not an array", `{"type":"message","content":"internal-host-42","stop_reason":"end_turn"}`},
 	}
 
 	for _, c := range cases {
@@ -345,6 +353,35 @@ func TestMalformedSuccessBodyIsBadGatewayWithoutEcho(t *testing.T) {
 			}
 			if out.Choices != nil {
 				t.Error("must not carry choices")
+			}
+		})
+	}
+}
+
+// The floor for "is a message document" is a content array. Fields the Origin
+// may omit or null — type, stop_reason — must not be required, or a real reply
+// is answered 502.
+func TestMessageDocumentWithoutOptionalFieldsStillRenders(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"stop_reason null, type present", `{"type":"message","stop_reason":null,"content":[{"type":"text","text":"hi"}]}`},
+		{"no type, no stop_reason", `{"content":[{"type":"text","text":"hi"}]}`},
+		{"empty content array", `{"type":"message","content":[],"stop_reason":"end_turn"}`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			rec := origin4xxReply(t, 200, c.body)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+			}
+			var out map[string]any
+			if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+				t.Fatalf("body is not JSON: %v (%s)", err, rec.Body.String())
+			}
+			if out["object"] != "chat.completion" {
+				t.Errorf("object = %v, want chat.completion", out["object"])
 			}
 		})
 	}
