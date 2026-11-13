@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"sync"
@@ -360,6 +361,9 @@ func (s *Server) profileForAccountMid(deviceMid string) *url.URL {
 	accs, _ := s.store.Accounts()
 	for _, a := range accs {
 		if a.DeviceMid == deviceMid {
+			if s.accountIsDirect(a.ID) {
+				return nil // operator chose direct — no line, no pool fallback
+			}
 			for _, p := range s.loadProxyProfiles() {
 				if p.BoundTo == a.ID && !p.Paused {
 					if u, err := url.Parse(p.URL); err == nil {
@@ -425,6 +429,9 @@ func (s *Server) restoreAccountLines() {
 func (s *Server) rebindAccountLine(deviceMid string, deadLine *url.URL) {
 	if deviceMid == "" || s.proxies == nil || s.proxies.Len() == 0 {
 		return
+	}
+	if s.directForAccountMid(deviceMid) {
+		return // direct accounts never get a line bound onto them
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -511,5 +518,43 @@ func (s *Server) bindAccountPool(accID int64) {
 	s.saveProxyProfiles(list)
 }
 
-// unbindAccount = same as pool (direct = no egress line; pool is the default path).
-func (s *Server) unbindAccount(accID int64) { s.bindAccountPool(accID) }
+// directKey is the settings key recording an operator's "Direct (no proxy)"
+// choice for one Account.
+func directKey(accID int64) string { return "egress_direct_" + strconv.FormatInt(accID, 10) }
+
+// setAccountDirect records (or clears) the direct choice. Clearing the pool
+// binding alone was not enough: profileForAccountMid falls back to the
+// persisted "line:<mid>" binding and then to a random pool line, so an Account
+// told "direct" still left the host through a proxy. The explicit flag is what
+// makes the choice survive that fallback.
+func (s *Server) setAccountDirect(accID int64, direct bool) {
+	s.bindAccountPool(accID) // no profile binding either way
+	if direct {
+		s.store.SetSetting(directKey(accID), "1")
+		return
+	}
+	s.store.SetSetting(directKey(accID), "0")
+}
+
+// accountIsDirect reports the operator's direct choice for an Account.
+func (s *Server) accountIsDirect(accID int64) bool {
+	return s.store.Setting(directKey(accID), "0") == "1"
+}
+
+// directForAccountMid is the Client hook: it must answer before any pool
+// fallback, otherwise "direct" silently becomes "some random line".
+func (s *Server) directForAccountMid(deviceMid string) bool {
+	if deviceMid == "" {
+		return false
+	}
+	accs, err := s.store.Accounts()
+	if err != nil {
+		return false
+	}
+	for _, a := range accs {
+		if a.DeviceMid == deviceMid {
+			return s.accountIsDirect(a.ID)
+		}
+	}
+	return false
+}

@@ -158,6 +158,7 @@ func NewServer(cfg config.Config) (*Server, error) {
 		Sticky:            s.sticky,  // chat failover: shared rotation when a bound line dies
 		Pool:              s.proxies, // billing family: round-robin spread
 		ProfileForAccount: s.profileForAccountMid,
+		DirectForAccount:  s.directForAccountMid,
 		OnEgressFail:      s.rebindAccountLine,
 	}
 	// The walk calls the interface, so production must fill it in here. Leaving

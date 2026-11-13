@@ -74,6 +74,7 @@ func (s *Server) accountsJSON() []map[string]any {
 			"risk_strikes":    a.RiskStrikes,
 			"cooling_until":   a.CoolingUntil,
 			"disabled_models": a.DisabledModels,
+			"egress_direct":   s.accountIsDirect(a.ID),
 		})
 	}
 	return out
@@ -476,9 +477,9 @@ func (s *Server) apiAccountsEdit(w http.ResponseWriter, r *http.Request) {
 	}
 	switch body.Egress {
 	case "direct":
-		s.unbindAccount(body.ID)
+		s.setAccountDirect(body.ID, true)
 	case "pool", "":
-		s.bindAccountPool(body.ID)
+		s.setAccountDirect(body.ID, false)
 	default:
 		var pid int64
 		if _, err := fmt.Sscanf(body.Egress, "%d", &pid); err == nil && pid > 0 {

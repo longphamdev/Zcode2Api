@@ -40,6 +40,12 @@ type Client struct {
 	// ProfileForAccount returns a per-account bound proxy URL (dashboard
 	// proxy profiles / auto per-account binding); nil = fall through to the pool.
 	ProfileForAccount func(accDeviceMid string) *url.URL
+	// DirectForAccount reports that the operator chose "direct (no proxy)" for
+	// this account. It must be asked BEFORE falling back to the pools: a nil
+	// from ProfileForAccount is indistinguishable from "no binding", so without
+	// this flag the account silently walks the sticky/rotate pool instead of
+	// going direct — the exact bug the flag exists to fix.
+	DirectForAccount func(accDeviceMid string) bool
 	// OnEgressFail reports that the account's swap-0 egress line failed at
 	// CONNECT level (dead proxy) — the gateway rebinds the account to a
 	// fresh line. Verdict-level failures are NOT reported (the line answers).
@@ -107,6 +113,9 @@ func (c *Client) pickLiveLine() *url.URL {
 // the provider's per-line connection cap ("Not Enough Connections").
 // Empty pool = nil = direct.
 func (c *Client) egressURL(mid string) *url.URL {
+	if c.DirectForAccount != nil && c.DirectForAccount(mid) {
+		return nil // operator chose direct: never spread onto the pool
+	}
 	if c.ProfileForAccount != nil {
 		if u := c.ProfileForAccount(mid); u != nil {
 			return u
@@ -446,13 +455,22 @@ func (c *Client) postMessages(ctx context.Context, jwt, deviceMid string, body [
 		}
 	retry:
 		var proxyURL *url.URL
+		direct := c.DirectForAccount != nil && c.DirectForAccount(deviceMid)
 		if c.ProfileForAccount != nil {
 			proxyURL = c.ProfileForAccount(deviceMid)
 			if swap > 0 && exclude != nil && proxyURL != nil && proxyURL.String() == exclude.String() {
 				proxyURL = nil // still the dead sid — fall through to sticky
 			}
 		}
-		if proxyURL == nil && c.Sticky != nil {
+		if direct {
+			// "Direct (no proxy)" is an operator decision, not a hint: asking
+			// again after one failure means the direct path already failed and
+			// the honest answer is that error, not a random pool line.
+			if swap > 0 {
+				return ret(nil, ErrLoadBlocked)
+			}
+			proxyURL = nil
+		} else if proxyURL == nil && c.Sticky != nil {
 			if swap == 0 {
 				proxyURL = c.Sticky.Next()
 			} else {

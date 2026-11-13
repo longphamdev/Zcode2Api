@@ -341,6 +341,7 @@ async function doPasteAdd() {
 
 /* edit modal */
 function egressOf(a) {
+  if (a.egress_direct) return 'direct';
   for (const p of PROFILES) if (p.bound_to_account === a.id) return String(p.id);
   return 'pool';
 }
