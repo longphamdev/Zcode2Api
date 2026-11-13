@@ -1,7 +1,10 @@
 package gateway
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -624,5 +627,167 @@ func TestChatCompletionsReturns404ForUnknownModel(t *testing.T) {
 	}
 	if out.Error.Code == nil || *out.Error.Code != "model_not_found" {
 		t.Errorf("code = %v, want model_not_found", out.Error.Code)
+	}
+}
+
+// fakeOrigin is the narrow slice of the upstream Client the request walk needs:
+// one method. The walk holds the whole Client today, which is why it cannot be
+// driven in a test.
+type fakeOrigin struct {
+	// reply produces a response per attempt; attempts are counted so a test can
+	// make the first fail and the next succeed.
+	reply func(attempt int) (*http.Response, error)
+	calls int
+}
+
+func (f *fakeOrigin) PostMessages(ctx context.Context, jwt, deviceMid string, body []byte, extra http.Header) (*http.Response, error) {
+	f.calls++
+	return f.reply(f.calls)
+}
+
+// The walk must hold and re-walk after a transient origin failure, not answer
+// 529 on the first refusal. This is the regression #16 introduced, and it lives
+// in the loop — the one place the per-function tests cannot reach.
+func TestWalkHoldsAndRetriesAfterTransientFailure(t *testing.T) {
+	db, err := store.OpenStore(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	acc, err := db.Add("jwt.a", "a")
+	if err != nil {
+		t.Fatalf("add account: %v", err)
+	}
+	if err := db.UpdateQuota(acc.ID, store.Quota{
+		Remaining: 10, Limit: 10,
+		Entitlements: []map[string]any{{"name": "GLM-5.3", "limit": 10, "remaining": 10}},
+	}); err != nil {
+		t.Fatalf("set quota: %v", err)
+	}
+	if err := db.Select(acc.ID); err != nil {
+		t.Fatalf("select: %v", err)
+	}
+
+	sse := strings.Join([]string{
+		`event: message_start` + "\n" + `data: {"type":"message_start","message":{"usage":{"input_tokens":5}}}` + "\n\n",
+		`event: content_block_start` + "\n" + `data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}` + "\n\n",
+		`event: content_block_delta` + "\n" + `data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}` + "\n\n",
+		`event: message_delta` + "\n" + `data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":5,"output_tokens":1}}` + "\n\n",
+		`event: message_stop` + "\n" + `data: {"type":"message_stop"}` + "\n\n",
+	}, "")
+
+	origin := &fakeOrigin{reply: func(attempt int) (*http.Response, error) {
+		if attempt == 1 {
+			// A transient failure that sets no cooldown and no dead marker —
+			// exactly the shape that used to look "servable" to the pool check.
+			return nil, errors.New("transient origin failure")
+		}
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": {"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(sse)),
+		}, nil
+	}}
+
+	srv := &Server{
+		store:     db,
+		catalog:   NewCatalog(nil),
+		origin:    origin,
+		stickyAcc: map[string]int64{},
+		quota1005: map[string]int{},
+		chatOK:    map[int64]time.Time{},
+		cfg: config.Config{
+			RequestHold:   10 * time.Minute,
+			AccountMaxTry: 1,
+		},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"GLM-5.3","messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		srv.handleChatCompletions(rec, req)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("handler never returned")
+	}
+
+	if origin.calls < 2 {
+		t.Errorf("origin called %d times, want >= 2 (the walk must retry after a transient failure)", origin.calls)
+	}
+	if rec.Code == http.StatusTooManyRequests || rec.Code == 529 {
+		t.Errorf("status = %d, want a retried success, not an overload", rec.Code)
+	}
+}
+
+// The opposite branch through the same real handler: a pool that cannot recover
+// inside the window must answer at once rather than sitting out the hold.
+func TestWalkFailsFastWhenPoolCannotRecover(t *testing.T) {
+	db, err := store.OpenStore(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	acc, err := db.Add("jwt.a", "a")
+	if err != nil {
+		t.Fatalf("add account: %v", err)
+	}
+	if err := db.UpdateQuota(acc.ID, store.Quota{
+		Remaining: 10, Limit: 10,
+		Entitlements: []map[string]any{{"name": "GLM-5.3", "limit": 10, "remaining": 10}},
+	}); err != nil {
+		t.Fatalf("set quota: %v", err)
+	}
+	// Cooling far past the hold: recovery is real but outside the window.
+	db.SetCooling(acc.ID, time.Now().Add(30*time.Minute).Unix())
+	if err := db.Select(acc.ID); err != nil {
+		t.Fatalf("select: %v", err)
+	}
+
+	origin := &fakeOrigin{reply: func(int) (*http.Response, error) {
+		t.Error("the Origin must not be called when the pool is hopeless")
+		return nil, errors.New("unreachable")
+	}}
+
+	srv := &Server{
+		store:     db,
+		catalog:   NewCatalog(nil),
+		origin:    origin,
+		stickyAcc: map[string]int64{},
+		quota1005: map[string]int{},
+		chatOK:    map[int64]time.Time{},
+		cfg: config.Config{
+			RequestHold:   10 * time.Minute,
+			AccountMaxTry: 1,
+		},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"GLM-5.3","messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+
+	start := time.Now()
+	srv.handleChatCompletions(rec, req)
+	elapsed := time.Since(start)
+
+	if elapsed > 5*time.Second {
+		t.Errorf("answered after %s; a hopeless pool must not sit out the 10m hold", elapsed.Round(time.Second))
+	}
+	if rec.Code != 529 {
+		t.Errorf("status = %d, want 529", rec.Code)
+	}
+	if got := rec.Header().Get("Retry-After"); got == "" || got == "0" {
+		t.Errorf("Retry-After = %q, want the real recovery time", got)
+	}
+	if origin.calls != 0 {
+		t.Errorf("origin called %d times, want 0", origin.calls)
 	}
 }

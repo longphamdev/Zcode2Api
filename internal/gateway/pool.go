@@ -20,14 +20,25 @@ import (
 	"zcode2api/internal/upstream"
 )
 
+// chatSender is what the request walk needs from the Origin: send one chat
+// request, return its response. Kept deliberately narrow.
+type chatSender interface {
+	PostMessages(ctx context.Context, jwt, deviceMid string, body []byte, extra http.Header) (*http.Response, error)
+}
+
 type Server struct {
-	cfg        config.Config
-	store      *store.Store
-	captcha    captcha.Solver
-	sticky     *proxy.StickyProxy
-	catalog    *Catalog
-	proxies    *proxy.ProxyPool
-	up         *upstream.Client
+	cfg     config.Config
+	store   *store.Store
+	captcha captcha.Solver
+	sticky  *proxy.StickyProxy
+	catalog *Catalog
+	proxies *proxy.ProxyPool
+	up      *upstream.Client
+	// origin is the slice of up that the request walk actually calls. When set
+	// it takes precedence, so a test can drive the walk without an Origin. One
+	// method, because one method is all the walk uses — widening it would make
+	// the test a mock of the implementation rather than of the dependency.
+	origin     chatSender
 	mu         sync.Mutex
 	loginFlows map[string]*loginFlow
 	warmOnce   sync.Once
@@ -150,6 +161,15 @@ func NewServer(cfg config.Config) (*Server, error) {
 		OnEgressFail:      s.rebindAccountLine,
 	}
 	return s, nil
+}
+
+// chatOrigin returns the Origin the walk should call: the injected one in
+// tests, otherwise the real client.
+func (s *Server) chatOrigin() chatSender {
+	if s.origin != nil {
+		return s.origin
+	}
+	return s.up
 }
 
 func (s *Server) importKeysFile() {

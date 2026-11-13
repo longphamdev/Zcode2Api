@@ -75,7 +75,7 @@ walk:
 				dumped = true
 			}
 			log.Printf("POST chat model=%s acc=%s %db", model, maskJWT(acc.JWT), len(payload))
-			resp, err := s.up.PostMessages(r.Context(), acc.JWT, acc.DeviceMid, payload, extra)
+			resp, err := s.chatOrigin().PostMessages(r.Context(), acc.JWT, acc.DeviceMid, payload, extra)
 			if err != nil {
 				// the client hung up: nothing downstream can succeed — no strike,
 				// no account switch, stop quietly (the write to a dead
