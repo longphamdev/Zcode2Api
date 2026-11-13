@@ -112,14 +112,23 @@ func ParseModel(body []byte) string {
 	return data.Model
 }
 
-func FracFromEntitlements(ents []map[string]any, model string) (float64, bool) {
+// FracFromEntitlements reports the fraction of the model's quota left in the
+// snapshot, and whether the plan carries the model at all. A period that has
+// ended as of now counts as a full refill, whatever the stale counters say.
+//
+// now is the caller's clock, not the wall clock: one decision reads this and
+// DeadUntilUnix within microseconds of each other, and if each took its own
+// time.Now() the Unix second could roll over in between — a quota judged spent
+// against the old second, then benched for the 24-hour fallback because the
+// reset was already "past" by the new one.
+func FracFromEntitlements(ents []map[string]any, model string, now time.Time) (float64, bool) {
 	want := Norm(model)
 	for _, e := range ents {
 		name := Str(e["name"])
 		if want != "" && Norm(name) != want {
 			continue
 		}
-		if pe := int64(AsInt(e["period_end"])); pe > 0 && pe <= time.Now().Unix() {
+		if pe := int64(AsInt(e["period_end"])); pe > 0 && pe <= now.Unix() {
 			return 1, true
 		}
 		rem := AsInt(e["remaining"])
@@ -146,12 +155,15 @@ func PeriodEndFromEntitlements(ents []map[string]any, model string) int64 {
 	return 0
 }
 
-func DeadUntilUnix(ents []map[string]any, model string) int64 {
-	now := time.Now().Unix()
-	if pe := PeriodEndFromEntitlements(ents, model); pe > now {
+// DeadUntilUnix is when a spent quota comes back: the period end when the
+// snapshot names one still ahead of now, otherwise a 24-hour fallback. See
+// FracFromEntitlements for why now is a parameter.
+func DeadUntilUnix(ents []map[string]any, model string, now time.Time) int64 {
+	n := now.Unix()
+	if pe := PeriodEndFromEntitlements(ents, model); pe > n {
 		return pe
 	}
-	return now + 86400
+	return n + 86400
 }
 
 func IsEmptyGrant(q store.Quota) bool {

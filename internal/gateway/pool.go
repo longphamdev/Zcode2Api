@@ -377,7 +377,7 @@ func (s *Server) pickExcept(model string, skip map[int64]bool) (*store.Account, 
 // not exist. An expired Account, or one whose plan was never fetched, says
 // nothing about the model — treating its silence as "unsupported" would answer
 // 400 for a model that is merely unavailable right now.
-func anyPlanOffersModel(accs []store.Account, model string) bool {
+func anyPlanOffersModel(accs []store.Account, model string, now time.Time) bool {
 	scanned := false
 	for _, a := range accs {
 		ents := entitlementsOf(a)
@@ -385,7 +385,7 @@ func anyPlanOffersModel(accs []store.Account, model string) bool {
 			return true // unscanned: cannot rule the model out
 		}
 		scanned = true
-		if _, ok := upstream.FracFromEntitlements(ents, model); ok {
+		if _, ok := upstream.FracFromEntitlements(ents, model, now); ok {
 			return true
 		}
 	}
@@ -440,7 +440,7 @@ func poolAvailability(accs []store.Account, dead map[string]int64, model string,
 		// merely busy/exhausted" from "no Account has it in its plan at all" —
 		// the first is an overload the client should retry, the second never
 		// will be.
-		if len(accs) > 0 && !anyPlanOffersModel(accs, model) {
+		if len(accs) > 0 && !anyPlanOffersModel(accs, model, now) {
 			return poolUnsupportedModel, time.Time{}
 		}
 		return poolHopeless, time.Time{}
@@ -489,10 +489,9 @@ type eligibility struct {
 // times: plan exclusion, model-scoped dead markers, and exhausted quota were each
 // honoured by one and missed by the other. Every drift was a live bug.
 //
-// No store writes, no rotation, no skipping: those are consequences of
-// choosing, not rules of eligibility, and they stay with the caller. The quota
-// helpers in upstream read the wall clock for period_end, so `now` governs the
-// marker and cooling comparisons only.
+// Pure: no store writes, no rotation, no skipping. Those are consequences of
+// choosing, not rules of eligibility, and they stay with the caller. Every
+// clock comparison, the quota period end included, is against the one `now`.
 func accountEligibility(a store.Account, model string, dead map[string]int64, now time.Time) eligibility {
 	nowUnix := now.Unix()
 	mkey := upstream.Norm(model)
@@ -509,7 +508,7 @@ func accountEligibility(a store.Account, model string, dead map[string]int64, no
 	ents := entitlementsOf(a)
 	spent := false
 	if len(ents) > 0 {
-		frac, ok := upstream.FracFromEntitlements(ents, model)
+		frac, ok := upstream.FracFromEntitlements(ents, model, now)
 		if !ok {
 			return eligibility{reason: ineligibleForever} // plan lacks the model
 		}
@@ -530,7 +529,7 @@ func accountEligibility(a store.Account, model string, dead map[string]int64, no
 	if spent {
 		// Without a period_end this is the 24-hour fallback the bench marker
 		// also uses, so the figure the walk reports is the one it will act on.
-		until = max(until, upstream.DeadUntilUnix(ents, model))
+		until = max(until, upstream.DeadUntilUnix(ents, model, now))
 	}
 	switch {
 	case blocked:
@@ -593,9 +592,10 @@ func (s *Server) markQuotaDead(cur *store.Account, model string) {
 	}
 	mkey := upstream.Norm(model)
 	ents := entitlementsOf(*cur)
-	frac, ok := upstream.FracFromEntitlements(ents, model)
+	now := time.Now()
+	frac, ok := upstream.FracFromEntitlements(ents, model, now)
 	if !ok || frac <= 0 {
-		until := upstream.DeadUntilUnix(ents, model)
+		until := upstream.DeadUntilUnix(ents, model, now)
 		s.store.MarkDead(cur.ID, mkey, until)
 		log.Printf("[pool] exhausted %s model=%s until %d", maskJWT(cur.JWT), model, until)
 		return
@@ -611,7 +611,7 @@ func (s *Server) markQuotaDead(cur *store.Account, model string) {
 	n := s.quota1005[key]
 	s.mu.Unlock()
 	if n >= 2 {
-		s.store.MarkDead(cur.ID, mkey, time.Now().Add(2*time.Minute).Unix())
+		s.store.MarkDead(cur.ID, mkey, now.Add(2*time.Minute).Unix())
 		log.Printf("[pool] 1005 %s ×%d with quota left — benched 2m, refreshing", maskJWT(cur.JWT), n)
 		go s.refreshAndRecheck(*cur, model)
 		return
@@ -633,8 +633,9 @@ func (s *Server) refreshAndRecheck(acc store.Account, model string) {
 	_ = s.store.UpdateQuota(acc.ID, q)
 	s.catalog.MergeFromQuota(q)
 	s.mu.Unlock()
-	if frac, ok := upstream.FracFromEntitlements(q.Entitlements, model); ok && frac <= 0 {
-		until := upstream.DeadUntilUnix(q.Entitlements, model)
+	now := time.Now()
+	if frac, ok := upstream.FracFromEntitlements(q.Entitlements, model, now); ok && frac <= 0 {
+		until := upstream.DeadUntilUnix(q.Entitlements, model, now)
 		s.store.MarkDead(acc.ID, upstream.Norm(model), until)
 		log.Printf("[pool] 1005 recheck %s: quota really gone — dead until %d", maskJWT(acc.JWT), until)
 		return

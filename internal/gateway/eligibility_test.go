@@ -16,9 +16,7 @@ func TestAccountEligibilityReasons(t *testing.T) {
 	now := time.Now()
 	nowUnix := now.Unix()
 	coolingUntil := now.Add(5 * time.Minute).Unix()
-	// The quota helpers read the wall clock for period_end, so the fixture is
-	// anchored to it as well.
-	periodEnd := time.Now().Add(48 * time.Hour).Unix()
+	periodEnd := now.Add(48 * time.Hour).Unix()
 	spentUntil := func(pe int64) string {
 		return fmt.Sprintf(`[{"name":"GLM-5.3","limit":10,"remaining":0,"period_end":%d}]`, pe)
 	}
@@ -107,7 +105,37 @@ func TestAccountEligibilityReasons(t *testing.T) {
 			name: "cooling with a plan that lacks the model",
 			acc:  store.Account{ID: 1, CoolingUntil: coolingUntil, QuotaJSON: `[{"name":"other","limit":10,"remaining":10}]`},
 			want: ineligibleForever,
-		}, {
+		},
+		{
+			// The period has ended as of now: the stale zero is a full refill.
+			name: "quota exhausted, period already reset",
+			acc:  store.Account{ID: 1, QuotaJSON: spentUntil(nowUnix - 1)},
+			want: eligibleNow,
+		},
+		{
+			// Boundary: FracFromEntitlements treats period_end <= now as reset,
+			// and DeadUntilUnix treats period_end <= now as "no reset ahead". The
+			// two must agree at the exact second, or a quota that just reset is
+			// benched for the 24-hour fallback.
+			name: "quota exhausted, period ends this second",
+			acc:  store.Account{ID: 1, QuotaJSON: spentUntil(nowUnix)},
+			want: eligibleNow,
+		},
+		{
+			// One second before the reset the quota is still spent, and the wait
+			// is to the reset — not to the fallback.
+			name:   "quota exhausted, period ends next second",
+			acc:    store.Account{ID: 1, QuotaJSON: spentUntil(nowUnix + 1)},
+			want:   ineligibleQuotaSpent,
+			wantAt: nowUnix + 1,
+		},
+		{
+			name:   "quota exhausted, no period_end: the 24-hour fallback",
+			acc:    store.Account{ID: 1, QuotaJSON: `[{"name":"GLM-5.3","limit":10,"remaining":0}]`},
+			want:   ineligibleQuotaSpent,
+			wantAt: nowUnix + 86400,
+		},
+		{
 			name: "plan has model, quota remains",
 			acc:  store.Account{ID: 1, QuotaJSON: `[{"name":"GLM-5.3","limit":10,"remaining":3}]`},
 			want: eligibleNow,
