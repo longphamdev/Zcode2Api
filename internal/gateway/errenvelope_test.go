@@ -191,25 +191,172 @@ func streamWithErrorEvent(t *testing.T) string {
 	}, "")
 }
 
-func TestStreamErrorEventReachesClientAsError(t *testing.T) {
-	sse := streamWithErrorEvent(t)
+// originStream drives writeOpenAIFromOrigin with a 200 event stream, in either
+// client mode.
+func originStream(t *testing.T, sse string, stream bool) *httptest.ResponseRecorder {
+	t.Helper()
 	var scn usageScanner
 	tee := io.NopCloser(io.TeeReader(strings.NewReader(sse), &scn))
 	resp := &http.Response{StatusCode: 200, Body: tee}
-
 	rec := httptest.NewRecorder()
 	srv := &Server{}
-	srv.writeOpenAIFromOrigin(rec, resp, []byte(sse), tee, "glm-5.3", true, &scn, false)
+	srv.writeOpenAIFromOrigin(rec, resp, []byte(sse), tee, "glm-5.3", stream, &scn, false)
+	return rec
+}
 
-	body := rec.Body.String()
-	if !strings.Contains(body, "origin is overloaded") {
-		t.Errorf("the origin's error message did not reach the client; body=%q", body)
+func sseEvent(ev, data string) string { return "event: " + ev + "\n" + "data: " + data + "\n\n" }
+
+var (
+	sseStart     = sseEvent("message_start", `{"type":"message_start","message":{"usage":{"input_tokens":5}}}`)
+	sseText      = sseEvent("content_block_delta", `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial internal-host-42"}}`)
+	sseStopDelta = sseEvent("message_delta", `{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}`)
+	sseStop      = sseEvent("message_stop", `{"type":"message_stop"}`)
+	sseError     = sseEvent("error", `{"type":"error","error":{"type":"overloaded_error","message":"origin is overloaded"}}`)
+)
+
+// An Origin error before any chunk has reached the client is an ordinary 502:
+// the response is not committed until the first chunk is written, and SDKs
+// branch on the status before they parse a single SSE line.
+func TestStreamErrorBeforeFirstChunkIsBadGateway(t *testing.T) {
+	rec := originStream(t, streamWithErrorEvent(t), true)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 (body=%s)", rec.Code, rec.Body.String())
 	}
-	// A bare [DONE] with no error frame is precisely the silent-empty-answer
-	// failure this guards.
-	if !strings.Contains(body, `"error"`) {
-		t.Errorf("stream carried no error frame; body=%q", body)
+	var out struct {
+		Error struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+		} `json:"error"`
 	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("body is not a JSON envelope: %v (%s)", err, rec.Body.String())
+	}
+	if out.Error.Message != "origin is overloaded" {
+		t.Errorf("message = %q, want the Origin's own", out.Error.Message)
+	}
+	if strings.Contains(rec.Body.String(), "[DONE]") {
+		t.Error("a failed stream must not end in [DONE]")
+	}
+}
+
+// Once a chunk is out the status is spent; the error travels as one SSE error
+// frame, and the stream must not end in [DONE].
+func TestStreamErrorAfterFirstChunkIsErrorFrame(t *testing.T) {
+	rec := originStream(t, sseStart+sseText+sseError, true)
+
+	frames, done := streamFrames(t, rec.Body.String())
+	if done {
+		t.Error("a failed stream must not end in [DONE]")
+	}
+	var errFrames int
+	for _, fr := range frames {
+		if e, ok := fr["error"].(map[string]any); ok {
+			errFrames++
+			if e["message"] != "origin is overloaded" {
+				t.Errorf("error.message = %v, want the Origin's own", e["message"])
+			}
+		}
+	}
+	if errFrames != 1 {
+		t.Errorf("got %d error frames, want exactly 1 (body=%s)", errFrames, rec.Body.String())
+	}
+}
+
+// A stream that stops before a finish trigger is not a reply. It used to get
+// [DONE] regardless, so a connection cut mid-answer looked like a short answer.
+func TestStreamEndingWithoutFinishIsNotClean(t *testing.T) {
+	t.Run("nothing written yet: 502", func(t *testing.T) {
+		rec := originStream(t, sseStart, true)
+		if rec.Code != http.StatusBadGateway {
+			t.Errorf("status = %d, want 502 (body=%s)", rec.Code, rec.Body.String())
+		}
+		if strings.Contains(rec.Body.String(), "[DONE]") {
+			t.Error("must not end in [DONE]")
+		}
+	})
+	t.Run("content written: error frame, no [DONE]", func(t *testing.T) {
+		rec := originStream(t, sseStart+sseText, true)
+		frames, done := streamFrames(t, rec.Body.String())
+		if done {
+			t.Error("must not end in [DONE]")
+		}
+		if len(frames) == 0 {
+			t.Fatal("no frames at all")
+		}
+		if _, ok := frames[len(frames)-1]["error"]; !ok {
+			t.Errorf("last frame is not an error frame: %v", frames[len(frames)-1])
+		}
+	})
+}
+
+// Either finish trigger alone is enough: the Origin's message_delta carries the
+// stop_reason, and message_stop follows, but a stream with only one of them is
+// still a finished message.
+func TestStreamEitherFinishTriggerIsClean(t *testing.T) {
+	for name, tail := range map[string]string{"stop_reason only": sseStopDelta, "message_stop only": sseStop, "both": sseStopDelta + sseStop} {
+		t.Run(name, func(t *testing.T) {
+			rec := originStream(t, sseStart+sseText+tail, true)
+			frames, done := streamFrames(t, rec.Body.String())
+			if !done {
+				t.Errorf("a finished stream must end in [DONE] (body=%s)", rec.Body.String())
+			}
+			for _, fr := range frames {
+				if _, ok := fr["error"]; ok {
+					t.Errorf("unexpected error frame: %v", fr)
+				}
+			}
+		})
+	}
+}
+
+// The client asked for a non-stream answer and the Origin streamed. Collecting
+// an error event, or a stream that stopped early, into an empty completion is
+// the same lie as [DONE] on the streaming path, under a different shape.
+func TestCollectedStreamFailureIsBadGateway(t *testing.T) {
+	cases := []struct {
+		name    string
+		sse     string
+		wantMsg string
+	}{
+		{"error event", streamWithErrorEvent(t), "origin is overloaded"},
+		{"error after content", sseStart + sseText + sseError, "origin is overloaded"},
+		{"ended without finish", sseStart + sseText, "origin returned a malformed response"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			rec := originStream(t, c.sse, false)
+			if rec.Code != http.StatusBadGateway {
+				t.Fatalf("status = %d, want 502 (body=%s)", rec.Code, rec.Body.String())
+			}
+			var out struct {
+				Error   *struct{ Message string } `json:"error"`
+				Choices []any                     `json:"choices"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+				t.Fatalf("body is not JSON: %v (%s)", err, rec.Body.String())
+			}
+			if out.Error == nil || out.Error.Message != c.wantMsg {
+				t.Errorf("error = %+v, want message %q", out.Error, c.wantMsg)
+			}
+			if out.Choices != nil {
+				t.Error("a failed collection must not carry choices")
+			}
+			if strings.Contains(rec.Body.String(), "internal-host-42") {
+				t.Error("partial content leaked into the error response")
+			}
+		})
+	}
+
+	t.Run("finished stream still renders", func(t *testing.T) {
+		rec := originStream(t, sseStart+sseText+sseStopDelta+sseStop, false)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), `"chat.completion"`) {
+			t.Errorf("not a completion: %s", rec.Body.String())
+		}
+	})
 }
 
 // The gateway's own 401 came from a hand-written JSON literal in the auth

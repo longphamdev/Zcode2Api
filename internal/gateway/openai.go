@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -395,7 +396,12 @@ func (s *Server) writeOpenAIFromOrigin(w http.ResponseWriter, resp *http.Respons
 	if !stream {
 		text, tools, err := collectAnthropic(src)
 		if err != nil {
-			writeOpenAIError(w, http.StatusBadGateway, err.Error())
+			// Nothing has been written yet, so this is an ordinary 502. The
+			// message is the Origin's own when it reported an error event; a
+			// stream that just stopped, or that the scanner could not read,
+			// gets the fixed one — scanner internals are not for the client.
+			log.Printf("[openai] Origin stream could not be rendered as a reply: %v", err)
+			writeOpenAIError(w, http.StatusBadGateway, originStreamMessage(err))
 			return
 		}
 		msg := map[string]any{"role": "assistant", "content": text}
@@ -420,16 +426,38 @@ func (s *Server) writeOpenAIFromOrigin(w http.ResponseWriter, resp *http.Respons
 	w.Header().Set("Cache-Control", "no-cache")
 	fl, _ := w.(http.Flusher)
 	st := &oaStreamState{toolIdx: map[int]int{}}
+	// Headers are only Set above; the response commits on the first chunk
+	// written. Until then a failure can still be a real 502, which SDKs branch
+	// on before they parse a single SSE line. After it, the only channel left
+	// is one error frame inside the stream.
+	wrote := false
 	err := scanAnthropicSSE(src, func(ev string, data map[string]any) {
+		if st.failed {
+			return // nothing after an Origin error is part of the reply
+		}
 		if chunk := anthEventToOA(ev, data, id, outModel, st); chunk != nil {
 			writeSSEChunk(w, fl, chunk)
+			wrote = true
 		}
 	})
-	if err != nil {
-		return
-	}
-	if st.failed {
-		// The error frame already went out; [DONE] would claim a clean finish.
+	if err != nil || !st.complete() {
+		// An Origin error event, a stream that ended before a finish trigger,
+		// or a body the scanner could not read. Each used to end in [DONE] —
+		// or in silence — and read as a clean, possibly empty, answer.
+		msg := "origin returned a malformed response"
+		if st.failed {
+			msg = st.errMsg
+		}
+		if err != nil {
+			log.Printf("[openai] Origin stream could not be read: %v", err)
+		} else if !st.failed {
+			log.Printf("[openai] Origin stream ended before the message finished")
+		}
+		if !wrote {
+			writeOpenAIError(w, http.StatusBadGateway, msg)
+			return
+		}
+		writeSSEChunk(w, fl, oaErrorFrame(msg))
 		return
 	}
 	// The scanner has now seen the whole body, message_delta included, so the
@@ -631,13 +659,48 @@ func startsWithByte(raw []byte, c byte) bool {
 	return len(raw) > 0 && raw[0] == c
 }
 
+// errOriginStream is why an Anthropic event stream could not be rendered as a
+// reply: the Origin reported an error, or the stream ended before a finish
+// trigger. Its message is safe to show the client.
+type errOriginStream struct{ msg string }
+
+func (e *errOriginStream) Error() string { return e.msg }
+
+// originStreamMessage is the client-facing message for a collection failure:
+// the Origin's own words when it reported an error, the fixed one otherwise,
+// so scanner internals never reach the client.
+func originStreamMessage(err error) string {
+	var oe *errOriginStream
+	if errors.As(err, &oe) {
+		return oe.msg
+	}
+	return "origin returned a malformed response"
+}
+
+// collectAnthropic gathers a whole Anthropic event stream into the text and
+// tool calls of one reply. It is a reply only if the stream reached a finish
+// trigger without an error event; otherwise an empty collection is not an empty
+// answer, and the error says why.
 func collectAnthropic(r io.Reader) (string, []any, error) {
 	var text strings.Builder
 	var tools []any
 	var curTool map[string]any
 	var args strings.Builder
+	var lc streamLifecycle
 	err := scanAnthropicSSE(r, func(ev string, data map[string]any) {
+		if lc.failed {
+			return
+		}
 		switch ev {
+		case "message_delta":
+			md, _ := data["delta"].(map[string]any)
+			if upstream.Str(md["stop_reason"]) != "" {
+				lc.finish()
+			}
+		case "message_stop":
+			lc.finish()
+		case "error":
+			lc.fail(data)
 		case "content_block_start":
 			cb, _ := data["content_block"].(map[string]any)
 			if upstream.Str(cb["type"]) == "tool_use" {
@@ -664,7 +727,16 @@ func collectAnthropic(r io.Reader) (string, []any, error) {
 			}
 		}
 	})
-	return text.String(), tools, err
+	if err != nil {
+		return "", nil, err
+	}
+	if lc.failed {
+		return "", nil, &errOriginStream{msg: lc.errMsg}
+	}
+	if !lc.finished {
+		return "", nil, &errOriginStream{msg: "origin returned a malformed response"}
+	}
+	return text.String(), tools, nil
 }
 
 func scanAnthropicSSE(r io.Reader, fn func(event string, data map[string]any)) error {
@@ -693,17 +765,60 @@ func scanAnthropicSSE(r io.Reader, fn func(event string, data map[string]any)) e
 	return sc.Err()
 }
 
+// streamLifecycle is what both readers of an Anthropic event stream need to
+// know about its shape: whether a finish trigger (message_delta with a
+// stop_reason, or message_stop) has been seen, and whether the Origin reported
+// an error on the way. A stream is a reply only when the first happened and the
+// second did not; anything else ending in [DONE] or a completion is a clean-
+// looking lie.
+type streamLifecycle struct {
+	finished bool
+	failed   bool
+	errMsg   string // the Origin's error message, or a fixed fallback
+}
+
+// finish records a finish trigger and reports whether it was the first. Only
+// the first wins: the Origin can send several message_delta events, and a
+// repeat must not emit a second finish_reason or let message_stop overwrite
+// "tool_calls" with "stop".
+func (l *streamLifecycle) finish() bool {
+	if l.finished {
+		return false
+	}
+	l.finished = true
+	return true
+}
+
+// fail records an Origin error event.
+func (l *streamLifecycle) fail(data map[string]any) {
+	e, _ := data["error"].(map[string]any)
+	l.errMsg = upstream.Str(e["message"])
+	if l.errMsg == "" {
+		l.errMsg = "the Origin failed mid-stream"
+	}
+	l.failed = true
+}
+
+// complete reports whether the stream can be called a reply.
+func (l *streamLifecycle) complete() bool { return l.finished && !l.failed }
+
 // oaStreamState tracks one converted stream. OpenAI numbers tool calls
 // 0,1,2… among tool calls only, while Anthropic's index counts every content
-// block (thinking and text included), so the two must be mapped. finished
-// records that finish_reason was already sent so message_stop doesn't
-// overwrite "tool_calls" with "stop".
+// block (thinking and text included), so the two must be mapped.
 type oaStreamState struct {
-	toolIdx  map[int]int
-	finished bool
-	// failed records that the Origin reported an error mid-stream; the writer
-	// must not append [DONE], which would signal a clean end.
-	failed bool
+	streamLifecycle
+	toolIdx map[int]int
+}
+
+// oaErrorFrame is the one SSE frame a stream can carry once it has started and
+// the Origin fails: the OpenAI error envelope, which clients branch on.
+func oaErrorFrame(msg string) map[string]any {
+	return map[string]any{"error": map[string]any{
+		"message": msg,
+		"type":    "api_error",
+		"param":   nil,
+		"code":    nil,
+	}}
 }
 
 func oaFinishReason(stopReason string) string {
@@ -761,39 +876,24 @@ func anthEventToOA(ev string, data map[string]any, id, model string, st *oaStrea
 	case "message_delta":
 		md, _ := data["delta"].(map[string]any)
 		if sr := upstream.Str(md["stop_reason"]); sr != "" {
-			// Only the first stop_reason wins. The origin can send several
-			// message_delta events (only the terminal one normally carries a
-			// reason), and a repeat must not emit a second finish_reason.
-			if st.finished {
+			if !st.finish() {
 				return nil
 			}
 			fr := oaFinishReason(sr)
 			finish = &fr
-			st.finished = true
 		}
 	case "message_stop":
-		if st.finished {
+		if !st.finish() {
 			return nil
 		}
 		fr := "stop"
 		finish = &fr
-		st.finished = true
 	case "error":
-		// The Origin can fail mid-stream. Relaying nothing and then [DONE]
-		// would read as a successful empty answer, so the error is forwarded as
-		// an SSE error frame the client can act on.
-		e, _ := data["error"].(map[string]any)
-		msg := upstream.Str(e["message"])
-		if msg == "" {
-			msg = "the Origin failed mid-stream"
-		}
-		st.failed = true
-		return map[string]any{"error": map[string]any{
-			"message": msg,
-			"type":    "api_error",
-			"param":   nil,
-			"code":    nil,
-		}}
+		// The Origin can fail mid-stream. Recorded here; the writer decides
+		// whether that becomes a 502 or an in-stream error frame, depending on
+		// whether anything has reached the client yet.
+		st.fail(data)
+		return nil
 	default:
 		return nil
 	}
