@@ -199,10 +199,22 @@ func (c *Client) claimPlan(ctx context.Context, base, jwt, mid, planID string) e
 		var cw struct {
 			Code int    `json:"code"`
 			Msg  string `json:"msg"`
+			Data struct {
+				Plan *struct {
+					PlanID string `json:"plan_id"`
+				} `json:"plan"`
+			} `json:"data"`
 		}
 		_ = json.Unmarshal(raw, &cw)
+		// 1003 alreadyClaimed is a success: the account has the plan, which is
+		// the outcome the caller wants, and no plan document accompanies it.
+		// A bare code 0 is different — it is only a successful claim when the
+		// Origin says which plan it granted, or there is nothing to distinguish
+		// it from a no-op.
 		switch {
-		case cw.Code == 0 || cw.Code == 1003:
+		case cw.Code == 1003:
+			return nil
+		case cw.Code == 0 && cw.Data.Plan != nil && cw.Data.Plan.PlanID != "":
 			return nil
 		case cw.Code == 3007 && attempt == 1:
 			continue // fresh captcha retry

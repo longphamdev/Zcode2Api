@@ -22,6 +22,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"zcode2api/internal/config"
@@ -148,7 +149,8 @@ func (c *Client) marketingPlans(ctx context.Context, jwt, mid string) []offeredP
 	if strings.TrimSpace(mid) == "" {
 		return nil // marketing/touch requires a device id
 	}
-	u := config.OriginBaseURL + "/api/v1/marketing/touch?seq=1"
+	seq := c.marketingSeq.Add(1) - 1
+	u := config.OriginBaseURL + "/api/v1/marketing/touch?seq=" + strconv.FormatUint(seq, 10)
 	headers := http.Header{}
 	headers.Set("X-Device-Mid", mid)
 	headers.Set("X-Client-Language", "en-US")

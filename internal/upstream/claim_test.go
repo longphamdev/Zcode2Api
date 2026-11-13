@@ -323,18 +323,17 @@ func TestClaimAlreadyOwnedPlanIsSkipped(t *testing.T) {
 		"transported in the problems string, recognised by callers via a string prefix.")
 }
 
-// TestClaimSuccessOnCodeZeroAlone — existing behaviour, PINNED SEPARATELY, and
-// the correctness question #24 must answer.
+// TestClaimPlanLessCodeZeroIsNotASuccess — the contract, flipped.
 //
-// `case cw.Code == 0 || cw.Code == 1003: return nil` treats a bare code 0 as a
-// successful claim even when the response grants no plan. The reference client
-// requires a plan document. Whether this is right or wrong is #24's decision —
-// this test only fixes the current behaviour so that decision is visible.
+// This test previously pinned code 0 with no plan document as a successful
+// claim, and logged it as a correctness question. The reference client requires
+// a plan document before it believes a claim landed, and it is right: a bare
+// code 0 is indistinguishable from a no-op, so reporting it as claimed tells
+// the operator a plan was granted when nothing proves one was.
 //
-// Deliberately NOT merged with the 1003 test below: if the two share one
-// assertion, a later change cannot be classified as "fixed a bug" versus
-// "redefined alreadyClaimed".
-func TestClaimSuccessOnCodeZeroAlone(t *testing.T) {
+// Deliberately NOT merged with the 1003 test below: alreadyClaimed is a genuine
+// success that carries no plan document, so the two codes must stay separable.
+func TestClaimPlanLessCodeZeroIsNotASuccess(t *testing.T) {
 	c, _ := newStub(t, func(path string, _ map[string]any) (int, string) {
 		switch {
 		case strings.HasSuffix(path, "/billing/preview"):
@@ -350,14 +349,36 @@ func TestClaimSuccessOnCodeZeroAlone(t *testing.T) {
 
 	claimed, problems := c.ClaimOfferedPlans(context.Background(), "jwt.test", "mid-test")
 
+	if claimed != "" {
+		t.Errorf("claimed = %q; a plan-less code 0 must not be reported as a claimed plan", claimed)
+	}
+	if !strings.Contains(problems, "code 0") {
+		t.Errorf("problems = %q, want the plan-less code 0 reported as a failure", problems)
+	}
+}
+
+// TestClaimCodeZeroWithPlanDocumentIsASuccess — the other half of the same
+// contract: code 0 IS a claim when the Origin names the granted plan.
+func TestClaimCodeZeroWithPlanDocumentIsASuccess(t *testing.T) {
+	c, _ := newStub(t, func(path string, _ map[string]any) (int, string) {
+		switch {
+		case strings.HasSuffix(path, "/billing/preview"):
+			return 200, previewBody("plan-withdoc")
+		case strings.HasSuffix(path, balancePath):
+			return 200, `{"code":0,"data":{"plans":[]}}`
+		case strings.HasSuffix(path, "/billing/claim"):
+			return 200, `{"code":0,"data":{"plan":{"plan_id":"plan-withdoc"}}}`
+		}
+		return 0, ""
+	})
+
+	claimed, problems := c.ClaimOfferedPlans(context.Background(), "jwt.test", "mid-test")
 	if problems != "" {
-		t.Fatalf("problems = %q; today a plan-less code 0 is accepted as success", problems)
+		t.Errorf("problems = %q, want none when the plan document is present", problems)
 	}
-	if !strings.Contains(claimed, "plan-beta") {
-		t.Fatalf("claimed = %q; today a plan-less code 0 is reported as a claimed plan", claimed)
+	if !strings.Contains(claimed, "plan-withdoc") {
+		t.Errorf("claimed = %q, want the granted plan", claimed)
 	}
-	t.Log("EXISTING BEHAVIOUR, CORRECTNESS QUESTION FOR #24: a claim answered code 0 " +
-		"with no plan document is reported as a successful claim.")
 }
 
 // TestClaimAlreadyClaimedCodeIsAccepted — existing behaviour, PINNED SEPARATELY.

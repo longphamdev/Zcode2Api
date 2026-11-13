@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"zcode2api/internal/captcha"
@@ -53,6 +54,12 @@ type Client struct {
 	// paying its timeout over and over; entries expire lazily.
 	breakMu sync.Mutex
 	benched map[string]time.Time
+
+	// marketingSeq is the snapshot cursor for marketing/touch. The endpoint
+	// takes a sequence number and the reference client advances it per call;
+	// a constant value has only ever been observed once, so advancing is the
+	// behaviour worth mirroring rather than guessing.
+	marketingSeq atomic.Uint64
 }
 
 // lineCooldown: how long a failed billing line stays out of rotation.

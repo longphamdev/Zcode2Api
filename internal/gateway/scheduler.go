@@ -11,6 +11,7 @@ import (
 	"context"
 	"log"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -18,6 +19,7 @@ import (
 func (s *Server) startSchedulers() {
 	s.warmOnce.Do(func() {
 		go s.dailyWarmLoop()
+		go s.claimTickLoop()
 	})
 	if s.quotaRefreshMin > 0 {
 		s.quotaOnce.Do(func() {
@@ -33,6 +35,47 @@ func (s *Server) dailyWarmLoop() {
 	for {
 		s.warmDueAccounts()
 		time.Sleep(time.Hour)
+	}
+}
+
+func (s *Server) claimTickLoop() {
+	for {
+		time.Sleep(claimTick)
+		s.claimDueAccounts()
+	}
+}
+
+// claimTick is how often the claim step is retried for an account that has
+// already been warmed today. Campaigns are first-come-first-served and quota
+// limited, so a daily gate loses the race outright: the reference client polls
+// every five minutes. The warm (activation events) gate stays daily — the
+// Origin dedups those by device_mid+date — but claiming is cheap and idempotent
+// (an owned plan is skipped), so it can ride a much shorter beat.
+const claimTick = 5 * time.Minute
+
+// claimDueAccounts runs only the claim step, for accounts warmed today. The
+// warm date gate is deliberately not consulted here.
+func (s *Server) claimDueAccounts() {
+	s.mu.Lock()
+	claim := s.autoClaim
+	s.mu.Unlock()
+	if !claim {
+		return
+	}
+	accs, err := s.store.Accounts()
+	if err != nil {
+		return
+	}
+	for _, a := range accs {
+		if a.Status != "" {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		claimed, problems := s.up.ClaimOfferedPlans(ctx, a.JWT, a.DeviceMid)
+		cancel()
+		if claimed != "" || (problems != "" && !strings.HasPrefix(problems, "already have:")) {
+			log.Printf("[claim-tick] %s claimed=%q problems=%q", maskJWT(a.JWT), claimed, problems)
+		}
 	}
 }
 
