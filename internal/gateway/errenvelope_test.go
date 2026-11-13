@@ -178,3 +178,34 @@ func TestUpstreamSuccessStillRendersCompletion(t *testing.T) {
 		t.Error("usage is missing from a successful response")
 	}
 }
+
+// An Origin error can also arrive as a 200-status stream carrying an `error`
+// event. Emitting nothing and then [DONE] would look like a successful empty
+// answer, which is the same lie the status fix removed for non-stream replies.
+func streamWithErrorEvent(t *testing.T) string {
+	return strings.Join([]string{
+		`event: message_start` + "\n" + `data: {"type":"message_start","message":{"usage":{"input_tokens":5}}}` + "\n\n",
+		`event: error` + "\n" + `data: {"type":"error","error":{"type":"overloaded_error","message":"origin is overloaded"}}` + "\n\n",
+	}, "")
+}
+
+func TestStreamErrorEventReachesClientAsError(t *testing.T) {
+	sse := streamWithErrorEvent(t)
+	var scn usageScanner
+	tee := io.NopCloser(io.TeeReader(strings.NewReader(sse), &scn))
+	resp := &http.Response{StatusCode: 200, Body: tee}
+
+	rec := httptest.NewRecorder()
+	srv := &Server{}
+	srv.writeOpenAIFromOrigin(rec, resp, []byte(sse), tee, "glm-5.3", true, &scn, false)
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "origin is overloaded") {
+		t.Errorf("the origin's error message did not reach the client; body=%q", body)
+	}
+	// A bare [DONE] with no error frame is precisely the silent-empty-answer
+	// failure this guards.
+	if !strings.Contains(body, `"error"`) {
+		t.Errorf("stream carried no error frame; body=%q", body)
+	}
+}

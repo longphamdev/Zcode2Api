@@ -383,7 +383,7 @@ func (s *Server) writeOpenAIFromOrigin(w http.ResponseWriter, resp *http.Respons
 	// fabricated chat.completion carrying an error status.
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		raw, _ := io.ReadAll(io.LimitReader(rest, 8<<20))
-		writeOpenAIFromUpstreamError(w, resp.StatusCode, raw)
+		writeOpenAIFromOriginError(w, resp.StatusCode, raw)
 		return
 	}
 	if !upstream.IsSSE(head) {
@@ -426,6 +426,10 @@ func (s *Server) writeOpenAIFromOrigin(w http.ResponseWriter, resp *http.Respons
 		}
 	})
 	if err != nil {
+		return
+	}
+	if st.failed {
+		// The error frame already went out; [DONE] would claim a clean finish.
 		return
 	}
 	// The scanner has now seen the whole body, message_delta included, so the
@@ -481,7 +485,7 @@ func withUsage(body map[string]any, u Usage) map[string]any {
 	return body
 }
 
-// writeOpenAIFromUpstreamError renders an Origin error reply as an OpenAI error
+// writeOpenAIFromOriginError renders an Origin error reply as an OpenAI error
 // envelope. The Origin answers errors in Anthropic shape —
 // {"type":"error","error":{"type":"...","code":"1213","message":"..."}} — so the
 // code and message are lifted out of that nest when present, and the status is
@@ -490,10 +494,10 @@ func withUsage(body map[string]any, u Usage) map[string]any {
 // This runs *before* any attempt to read the body as a completion: deciding on
 // parseability instead is what produced a fabricated chat.completion attached to
 // an HTTP 400.
-func writeOpenAIFromUpstreamError(w http.ResponseWriter, status int, raw []byte) {
+func writeOpenAIFromOriginError(w http.ResponseWriter, status int, raw []byte) {
 	var doc struct {
 		Error *struct {
-			// The Origin sends code as a string ("1213"), but other upstreams
+			// The Origin sends code as a string ("1213"), but other sources
 			// send a number. Accept either rather than silently losing it.
 			Code    json.RawMessage `json:"code"`
 			Message string          `json:"message"`
@@ -501,7 +505,7 @@ func writeOpenAIFromUpstreamError(w http.ResponseWriter, status int, raw []byte)
 	}
 	_ = json.Unmarshal(raw, &doc)
 
-	msg := "upstream request failed"
+	msg := "the Origin rejected the request"
 	var code *string
 	if doc.Error != nil {
 		if doc.Error.Message != "" {
@@ -513,13 +517,13 @@ func writeOpenAIFromUpstreamError(w http.ResponseWriter, status int, raw []byte)
 	}
 	if doc.Error == nil && len(bytes.TrimSpace(raw)) > 0 {
 		// Not the shape we expected; keep a readable trace rather than dropping it.
-		msg = "upstream request failed: " + clip(string(raw), 200)
+		msg = "the Origin rejected the request: " + clip(string(raw), 200)
 	}
 	writeOpenAIErrorDetail(w, status, msg, code)
 }
 
 // rawScalarString renders a JSON string or number as a plain string, and
-// anything else as "". Upstream error codes arrive as either type.
+// anything else as "". Origin error codes arrive as either type.
 func rawScalarString(raw json.RawMessage) string {
 	if len(raw) == 0 {
 		return ""
@@ -663,6 +667,9 @@ func scanAnthropicSSE(r io.Reader, fn func(event string, data map[string]any)) e
 type oaStreamState struct {
 	toolIdx  map[int]int
 	finished bool
+	// failed records that the Origin reported an error mid-stream; the writer
+	// must not append [DONE], which would signal a clean end.
+	failed bool
 }
 
 func oaFinishReason(stopReason string) string {
@@ -737,6 +744,22 @@ func anthEventToOA(ev string, data map[string]any, id, model string, st *oaStrea
 		fr := "stop"
 		finish = &fr
 		st.finished = true
+	case "error":
+		// The Origin can fail mid-stream. Relaying nothing and then [DONE]
+		// would read as a successful empty answer, so the error is forwarded as
+		// an SSE error frame the client can act on.
+		e, _ := data["error"].(map[string]any)
+		msg := upstream.Str(e["message"])
+		if msg == "" {
+			msg = "the Origin failed mid-stream"
+		}
+		st.failed = true
+		return map[string]any{"error": map[string]any{
+			"message": msg,
+			"type":    "api_error",
+			"param":   nil,
+			"code":    nil,
+		}}
 	default:
 		return nil
 	}

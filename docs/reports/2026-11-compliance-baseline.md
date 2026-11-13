@@ -53,10 +53,12 @@ Model makes no difference to any outcome — both go through the same path.
 
 ## Known gaps and unverified branches
 
-**Fake completion on an upstream 4xx.** An Origin error whose body is valid JSON
-is rendered as a completion with the error status attached — `HTTP 400` wrapping
-`{"choices":[...],"object":"chat.completion"}`. Pre-existing, not a regression.
-Tracked separately.
+**Fake completion on an upstream 4xx — fixed.** An Origin error whose body was
+valid JSON used to be rendered as a completion with the error status attached.
+The status now decides the response shape before the body is read as a reply, and
+a mid-stream error event reaches the client as an error frame rather than an
+empty stream closed by `[DONE]`. The measurement below predates that fix and is
+unchanged by it — the failing-test set is the same.
 
 **Not verified end to end**, only by unit test:
 
