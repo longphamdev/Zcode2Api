@@ -27,12 +27,76 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// the Anthropic wire format has no place for them, so the conversion below
 	// drops them.
 	includeUsage := ParseIncludeUsage(raw)
+	switch ClassifyResponseFormat(raw) {
+	case rfUnsupported:
+		// The client set strict: true — an explicit contract for schema
+		// conformance we cannot provide. Refuse now rather than return prose it
+		// will fail to parse with no clue why. See docs/adr/0001.
+		writeOpenAIError(w, http.StatusBadRequest,
+			"response_format json_schema with strict:true is not supported by this gateway: "+
+				"the origin does not enforce JSON schemas, so the schema would be silently ignored")
+		return
+	case rfDropped:
+		log.Printf("[openai] response_format dropped: the origin does not enforce JSON schemas")
+	}
 	anth, err := OpenAIToAnthropic(raw)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	s.routeAnthropic(w, r, anth, true, includeUsage)
+}
+
+// responseFormatKind classifies what a request's response_format asks of us.
+type responseFormatKind int
+
+const (
+	// rfNone: no response_format, or an explicit "text" — nothing to do.
+	rfNone responseFormatKind = iota
+	// rfDropped: the client asked for JSON but not for a guarantee, and the
+	// origin cannot honour a schema. Serve normally; the field does not reach
+	// the origin, so log that it was dropped.
+	rfDropped
+	// rfUnsupported: the client set strict: true, which is an explicit contract
+	// for schema conformance. We cannot provide it, so refuse rather than hand
+	// back prose the client will fail to parse with no clue why.
+	rfUnsupported
+)
+
+// ClassifyResponseFormat reads the OpenAI-only response_format option from the
+// client's body — it has no Anthropic equivalent, so the conversion downstream
+// drops it and it has to be inspected first.
+//
+// `strict` lives at response_format.json_schema.strict, is optional, and
+// defaults to false, so a request that omits it is ordinary best-effort and
+// must keep working. Anything we cannot parse is treated as non-strict: a
+// malformed field we were going to drop anyway is not worth rejecting over.
+func ClassifyResponseFormat(raw []byte) responseFormatKind {
+	var req struct {
+		ResponseFormat *struct {
+			Type       string `json:"type"`
+			JSONSchema *struct {
+				Strict *bool `json:"strict"`
+			} `json:"json_schema"`
+		} `json:"response_format"`
+	}
+	if json.Unmarshal(raw, &req) != nil || req.ResponseFormat == nil {
+		return rfNone
+	}
+	switch req.ResponseFormat.Type {
+	case "json_object":
+		return rfDropped
+	case "json_schema":
+		if req.ResponseFormat.JSONSchema != nil &&
+			req.ResponseFormat.JSONSchema.Strict != nil &&
+			*req.ResponseFormat.JSONSchema.Strict {
+			return rfUnsupported
+		}
+		return rfDropped
+	default:
+		// "text", or a type we do not know: leave the request alone.
+		return rfNone
+	}
 }
 
 func OpenAIToAnthropic(raw []byte) ([]byte, error) {
