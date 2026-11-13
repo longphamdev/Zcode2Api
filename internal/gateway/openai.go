@@ -516,8 +516,12 @@ func writeOpenAIFromOriginError(w http.ResponseWriter, status int, raw []byte) {
 		}
 	}
 	if doc.Error == nil && len(bytes.TrimSpace(raw)) > 0 {
-		// Not the shape we expected; keep a readable trace rather than dropping it.
-		msg = "the Origin rejected the request: " + clip(string(raw), 200)
+		// Not the error shape we expected. The body could be an HTML page from
+		// something in between, or an internal trace — none of which belongs in
+		// a client-facing message. Keep it in the server log for diagnosis and
+		// tell the client something stable.
+		log.Printf("[openai] Origin returned %d with an unrecognised error body: %s",
+			status, clip(string(raw), 200))
 	}
 	writeOpenAIErrorDetail(w, status, msg, code)
 }

@@ -7,6 +7,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"zcode2api/internal/config"
 )
 
 // OpenAI clients branch on error.type, and the value differs by status: a
@@ -207,5 +209,94 @@ func TestStreamErrorEventReachesClientAsError(t *testing.T) {
 	// failure this guards.
 	if !strings.Contains(body, `"error"`) {
 		t.Errorf("stream carried no error frame; body=%q", body)
+	}
+}
+
+// The gateway's own 401 came from a hand-written JSON literal in the auth
+// middleware, so it carried only two of the four members the spec requires —
+// inconsistent with every envelope produced through writeOpenAIErrorDetail.
+func TestGatewayAuthEnvelopeCarriesAllRequiredMembers(t *testing.T) {
+	srv := &Server{cfg: config.Config{GatewayKey: "right"}}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader("{}"))
+	req.Header.Set("Authorization", "Bearer wrong")
+	rec := httptest.NewRecorder()
+
+	srv.withGatewayAuth(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("the handler must not run for a rejected key")
+	})(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+
+	var out struct {
+		Error map[string]json.RawMessage `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("body is not JSON: %v (%s)", err, rec.Body.String())
+	}
+	for _, k := range []string{"type", "message", "param", "code"} {
+		if _, present := out.Error[k]; !present {
+			t.Errorf("error.%s is absent; got %s", k, rec.Body.String())
+		}
+	}
+	var typ string
+	_ = json.Unmarshal(out.Error["type"], &typ)
+	if typ != "authentication_error" {
+		t.Errorf("type = %q, want authentication_error", typ)
+	}
+	var msg string
+	_ = json.Unmarshal(out.Error["message"], &msg)
+	if msg != "invalid gateway key" {
+		t.Errorf("message = %q, want the existing wording unchanged", msg)
+	}
+}
+
+// A non-2xx reply that is not in the Origin's error shape must not have its body
+// echoed to the client. Up to 200 bytes of whatever the Origin said — an HTML
+// error page, an internal trace — used to be pasted into error.message.
+func TestUpstreamErrorDoesNotEchoRawBody(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"html error page", `<html><body>502 Bad Gateway<br>nginx/1.24.0</body></html>`},
+		{"json that is not the error shape", `{"unexpected":"shape","secret":"internal-host-42"}`},
+		{"empty body", ``},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			rec := origin4xxReply(t, 502, c.body)
+
+			var out struct {
+				Error struct {
+					Message string `json:"message"`
+					Type    string `json:"type"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+				t.Fatalf("body is not JSON: %v (%s)", err, rec.Body.String())
+			}
+			for _, leak := range []string{"nginx", "internal-host-42", "<html", "unexpected"} {
+				if strings.Contains(out.Error.Message, leak) {
+					t.Errorf("message echoes origin body (%q found): %q", leak, out.Error.Message)
+				}
+			}
+			if out.Error.Message == "" {
+				t.Error("message is empty; a client needs something readable")
+			}
+			if out.Error.Type == "" {
+				t.Error("type is empty")
+			}
+			var full map[string]any
+			if err := json.Unmarshal(rec.Body.Bytes(), &full); err != nil {
+				t.Fatalf("body is not JSON: %v", err)
+			}
+			if _, present := full["choices"]; present {
+				t.Error("a non-2xx reply must not carry choices")
+			}
+		})
 	}
 }

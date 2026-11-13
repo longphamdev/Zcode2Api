@@ -494,9 +494,10 @@ func (s *Server) withGatewayAuth(next http.HandlerFunc) http.HandlerFunc {
 			got = r.Header.Get("x-api-key")
 		}
 		if got != key {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusUnauthorized)
-			w.Write([]byte(`{"error":{"message":"invalid gateway key","type":"authentication_error"}}`))
+			// Same writer as every other error so the envelope shape cannot
+			// drift: the spec marks param and code required, and a hand-written
+			// literal here used to omit them.
+			writeOpenAIError(w, http.StatusUnauthorized, "invalid gateway key")
 			return
 		}
 		next(w, r)
