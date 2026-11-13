@@ -164,3 +164,21 @@ func TestRecoveryAtIgnoresOtherModelsDeadMarkers(t *testing.T) {
 		t.Errorf("recovery in %s for glm53, want ~20m — another model's marker leaked in", d)
 	}
 }
+
+// An Account whose plan does not include this model can never serve it, so it
+// must not contribute a recovery time — pickExcept already refuses it.
+func TestRecoveryAtIgnoresPlanWithoutModel(t *testing.T) {
+	now := time.Now()
+	// The plan was scanned and does not carry this model at all.
+	// Cooling as well, so the exclusion is the only thing that can explain a
+	// correct answer — otherwise the account would simply read as servable.
+	accs := []store.Account{{
+		ID:           1,
+		CoolingUntil: now.Add(5 * time.Minute).Unix(),
+		QuotaJSON:    `[{"name":"other-model","limit":100,"remaining":100}]`,
+	}}
+
+	if until, _, waiting := recoveryAt(accs, nil, "GLM-5.3", now); waiting {
+		t.Errorf("an account whose plan lacks this model never recovers for it; got a wait until %s", until)
+	}
+}

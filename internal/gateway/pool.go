@@ -374,6 +374,22 @@ func (s *Server) pickExcept(model string, skip map[int64]bool) (*store.Account, 
 	return nil, fmt.Errorf("pool empty for model %s", model)
 }
 
+// planOffersModel reports whether the Account's scanned plan includes this
+// model. An Account whose plan was never scanned (no entitlements) is given the
+// benefit of the doubt: the pool cannot know it is unusable, and pickExcept
+// behaves the same way.
+//
+// Without this, an Account excluded from the plan looks like a recovering
+// candidate and contributes a recovery time for a model it can never serve.
+func planOffersModel(a store.Account, model string) bool {
+	ents := entitlementsOf(a)
+	if len(ents) == 0 {
+		return true // plan never scanned: not evidence of exclusion
+	}
+	_, ok := upstream.FracFromEntitlements(ents, model)
+	return ok
+}
+
 // poolOutcome is what the hold decision needs to know about the Pool.
 type poolOutcome int
 
@@ -459,6 +475,9 @@ func recoveryAt(accs []store.Account, dead map[string]int64, model string, now t
 		}
 		if modelExcluded(a, model) {
 			continue // not this model's account, in any timeframe
+		}
+		if !planOffersModel(a, model) {
+			continue // the scanned plan does not carry this model at all
 		}
 		if until, ok := dead[fmt.Sprintf("%d:%s", a.ID, upstream.Norm(model))]; ok {
 			consider(until)
