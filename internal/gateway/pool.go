@@ -318,18 +318,15 @@ func (s *Server) pickExcept(model string, skip map[int64]bool) (*store.Account, 
 		}
 		// The eligibility ladder is shared with recoveryAt — see
 		// accountEligibility. Its side effects stay here: skipping is per-walk
-		// state, and benching an exhausted Account is a consequence of choosing,
-		// not a rule of eligibility.
-		if accountEligibility(a, model, deadUntil, now).reason != eligibleNow {
-			if ents := entitlementsOf(a); len(ents) > 0 {
-				if frac, ok := upstream.FracFromEntitlements(ents, model); ok && frac <= 0 {
-					// quota exhausted — bench until the period resets
-					s.store.MarkDead(a.ID, mkey, upstream.DeadUntilUnix(ents, model))
-				}
-			}
+		// state, and benching a spent Account is a consequence of choosing, not a
+		// rule of eligibility. Only that one reason benches; every other
+		// exclusion leaves marker state alone.
+		e := accountEligibility(a, model, deadUntil, now)
+		if e.reason == ineligibleQuotaSpent {
+			s.store.MarkDead(a.ID, mkey, e.until.Unix())
 			return false
 		}
-		return true
+		return e.reason == eligibleNow
 	}
 	// session affinity: keep serving the SAME account per model until it
 	// dies (quota exhausted, chat flag, cooldown) — the real-user pattern.
@@ -370,27 +367,6 @@ func (s *Server) pickExcept(model string, skip map[int64]bool) (*store.Account, 
 		return &a, nil
 	}
 	return nil, fmt.Errorf("pool empty for model %s", model)
-}
-
-// planOffersModel reports whether the Account's scanned plan includes this
-// model. An Account whose plan was never scanned (no entitlements) is given the
-// benefit of the doubt: the pool cannot know it is unusable, and pickExcept
-// behaves the same way.
-//
-// Without this, an Account excluded from the plan looks like a recovering
-// candidate and contributes a recovery time for a model it can never serve.
-func planOffersModel(a store.Account, model string) bool {
-	ents := entitlementsOf(a)
-	if len(ents) == 0 {
-		return true // plan never scanned: not evidence of exclusion
-	}
-	frac, ok := upstream.FracFromEntitlements(ents, model)
-	if !ok {
-		return false // model not in the scanned plan
-	}
-	// Exhausted quota is not a wait either: pickExcept refuses it, and the reset
-	// is a billing period away, not a hold window.
-	return frac > 0
 }
 
 // anyPlanOffersModel reports whether any Account's scanned plan carries this
@@ -482,13 +458,18 @@ const (
 	// eligibleNow: the Account can serve this model at this instant.
 	eligibleNow eligibilityReason = iota
 	// ineligibleUntil: it cannot now, but a known instant will change that
-	// (cooling, or a model-scoped dead marker). The zero time means the marker
-	// lapsed and the Account is usable.
+	// (cooling, or a model-scoped dead marker). `until` is always in the future;
+	// a marker that has already lapsed yields eligibleNow instead.
 	ineligibleUntil
 	// ineligibleForever: nothing about this Account will make it serve this
-	// model — expired, revoked, excluded for the model, the plan lacks it, or
-	// its quota is spent.
+	// model — expired, revoked, excluded for the model, or the plan lacks it.
 	ineligibleForever
+	// ineligibleQuotaSpent: the plan carries the model but the quota is gone.
+	// Kept distinct from ineligibleForever because refusing this Account also
+	// benches it, and only this reason should. Folding it into the generic case
+	// made the caller re-derive the condition, which then benched Accounts that
+	// were merely cooling and overwrote live markers.
+	ineligibleQuotaSpent
 )
 
 // eligibility is the outcome of accountEligibility.
@@ -517,6 +498,16 @@ func accountEligibility(a store.Account, model string, dead map[string]int64, no
 	if modelExcluded(a, model) {
 		return eligibility{reason: ineligibleForever} // excluded for this model
 	}
+	// Order matters, and it matches the pre-refactor ladder: a temporary
+	// condition is reported before a permanent one. That keeps the quota arm from
+	// firing — and therefore benching the Account — when the real reason is a
+	// cooldown or a marker that is already in place.
+	if until, ok := dead[fmt.Sprintf("%d:%s", a.ID, mkey)]; ok && until > nowUnix {
+		return eligibility{reason: ineligibleUntil, until: time.Unix(until, 0)}
+	}
+	if a.CoolingUntil > nowUnix {
+		return eligibility{reason: ineligibleUntil, until: time.Unix(a.CoolingUntil, 0)}
+	}
 	ents := entitlementsOf(a)
 	if len(ents) > 0 {
 		frac, ok := upstream.FracFromEntitlements(ents, model)
@@ -524,14 +515,8 @@ func accountEligibility(a store.Account, model string, dead map[string]int64, no
 			return eligibility{reason: ineligibleForever} // plan lacks the model
 		}
 		if frac <= 0 {
-			return eligibility{reason: ineligibleForever} // quota spent
+			return eligibility{reason: ineligibleQuotaSpent, until: time.Unix(upstream.DeadUntilUnix(ents, model), 0)}
 		}
-	}
-	if until, ok := dead[fmt.Sprintf("%d:%s", a.ID, mkey)]; ok && until > nowUnix {
-		return eligibility{reason: ineligibleUntil, until: time.Unix(until, 0)}
-	}
-	if a.CoolingUntil > nowUnix {
-		return eligibility{reason: ineligibleUntil, until: time.Unix(a.CoolingUntil, 0)}
 	}
 	return eligibility{reason: eligibleNow}
 }

@@ -176,15 +176,15 @@ func TestRecoveryAtIgnoresOtherModelsDeadMarkers(t *testing.T) {
 
 // An Account whose plan does not include this model can never serve it, so it
 // must not contribute a recovery time — pickExcept already refuses it.
+// A plan that lacks the model means this Account never serves it, whatever its
+// cooling state. No cooling here, so the plan is the only thing that can explain
+// the answer — with a cooldown present the temporary reason is reported first,
+// matching what pickExcept would do.
 func TestRecoveryAtIgnoresPlanWithoutModel(t *testing.T) {
 	now := time.Now()
-	// The plan was scanned and does not carry this model at all.
-	// Cooling as well, so the exclusion is the only thing that can explain a
-	// correct answer — otherwise the account would simply read as servable.
 	accs := []store.Account{{
-		ID:           1,
-		CoolingUntil: now.Add(5 * time.Minute).Unix(),
-		QuotaJSON:    `[{"name":"other-model","limit":100,"remaining":100}]`,
+		ID:        1,
+		QuotaJSON: `[{"name":"other-model","limit":100,"remaining":100}]`,
 	}}
 
 	if until, _, waiting := recoveryAt(accs, nil, "GLM-5.3", now); waiting {

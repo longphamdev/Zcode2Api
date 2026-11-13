@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -49,9 +50,10 @@ func TestAccountEligibilityReasons(t *testing.T) {
 			want: ineligibleForever,
 		},
 		{
+			// Distinct from ineligibleForever: this reason also benches the Account.
 			name: "quota exhausted",
 			acc:  store.Account{ID: 1, QuotaJSON: `[{"name":"GLM-5.3","limit":10,"remaining":0}]`},
-			want: ineligibleForever,
+			want: ineligibleQuotaSpent,
 		},
 		{
 			name:   "cooling",
@@ -84,7 +86,7 @@ func TestAccountEligibilityReasons(t *testing.T) {
 			if got.reason != c.want {
 				t.Fatalf("reason = %v, want %v", got.reason, c.want)
 			}
-			if c.want == ineligibleUntil && got.until.Unix() != c.wantAt {
+			if c.want == ineligibleUntil && c.wantAt != 0 && got.until.Unix() != c.wantAt {
 				t.Errorf("until = %d, want %d", got.until.Unix(), c.wantAt)
 			}
 		})
@@ -140,4 +142,71 @@ func TestPickExceptBenchesExhaustedQuota(t *testing.T) {
 	if dead := db.DeadSet(); !dead["1:glm53"] {
 		t.Errorf("the exhausted Account was not benched; dead set = %v", dead)
 	}
+}
+
+// Benching must fire only for spent quota — not for an Account that is already
+// excluded for another reason. Ordering matters: if the quota arm is evaluated
+// before cooling or a live marker, an Account that was merely cooling gets
+// benched, and an Account with a live marker has that marker's expiry
+// overwritten. Neither happened before the eligibility ladder was unified.
+func TestPickExceptDoesNotBenchForOtherReasons(t *testing.T) {
+	setup := func(t *testing.T, mutate func(db *store.Store, id int64)) (*Server, *store.Store, int64) {
+		t.Helper()
+		db, err := store.OpenStore(filepath.Join(t.TempDir(), "t.db"))
+		if err != nil {
+			t.Fatalf("open store: %v", err)
+		}
+		t.Cleanup(func() { _ = db.Close() })
+		acc, err := db.Add("jwt.a", "a")
+		if err != nil {
+			t.Fatalf("add account: %v", err)
+		}
+		if err := db.UpdateQuota(acc.ID, store.Quota{
+			Remaining: 0, Limit: 10,
+			Entitlements: []map[string]any{{
+				"name": "GLM-5.3", "limit": 10, "remaining": 0,
+				"period_end": time.Now().Add(24 * time.Hour).Unix(),
+			}},
+		}); err != nil {
+			t.Fatalf("set quota: %v", err)
+		}
+		mutate(db, acc.ID)
+		srv := &Server{
+			store:     db,
+			catalog:   NewCatalog(nil),
+			stickyAcc: map[string]int64{},
+			quota1005: map[string]int{},
+			chatOK:    map[int64]time.Time{},
+			cfg:       config.Config{RequestHold: time.Minute, AccountMaxTry: 1},
+		}
+		return srv, db, acc.ID
+	}
+
+	t.Run("cooling with spent quota is not benched", func(t *testing.T) {
+		srv, db, _ := setup(t, func(db *store.Store, id int64) {
+			db.SetCooling(id, time.Now().Add(10*time.Minute).Unix())
+		})
+		if picked, _ := srv.pickExcept("GLM-5.3", nil); picked != nil {
+			t.Fatalf("picked a cooling Account")
+		}
+		if dead := db.DeadSet(); len(dead) != 0 {
+			t.Errorf("a cooling Account was benched; dead set = %v — the pre-existing marker or its absence must be untouched", dead)
+		}
+	})
+
+	t.Run("live marker with spent quota keeps its own expiry", func(t *testing.T) {
+		var wantUntil int64
+		srv, db, id := setup(t, func(db *store.Store, id int64) {
+			// A marker far out; the quota period resets much sooner.
+			wantUntil = time.Now().Add(30 * 24 * time.Hour).Unix()
+			db.MarkDead(id, "glm53", wantUntil)
+		})
+		if picked, _ := srv.pickExcept("GLM-5.3", nil); picked != nil {
+			t.Fatalf("picked an Account with a live marker")
+		}
+		got := db.DeadUntil()[fmt.Sprintf("%d:glm53", id)]
+		if got != wantUntil {
+			t.Errorf("marker expiry = %d, want %d — benching overwrote a live marker", got, wantUntil)
+		}
+	})
 }
