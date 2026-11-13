@@ -952,3 +952,28 @@ func TestClaimHoldIsZeroWithoutAnEndsAt(t *testing.T) {
 		t.Fatalf("hold = %d, want 0 when no face carried ends_at", hold)
 	}
 }
+
+// TestBannerCarriesEndsAt — the banner payload measured 2026-11-13
+// (.scratch/claim-gap-vs-zcode-api.md:33), verbatim. ends_at must survive the
+// structural walk or the hold horizon never exists and the tick cannot stop
+// polling a won campaign.
+func TestBannerCarriesEndsAt(t *testing.T) {
+	raw := `[{"campaign_id":"wk-1113","banner":{"buttons":[{"action":{"type":"claim_zcode_plan","args":{"plan_id":"zcode-v3-start-plan-1113-wk"}}}],
+"background":{"args":{"zcode_plan":{"plan_id":"zcode-v3-start-plan-1113-wk",
+"name":"ZCODE WEEKEND BUILD","priority":101,"starts_at":1794567600,"ends_at":1794790800,
+"entitlements":[{"show_name":"GLM-5.3-Flash","grant_units":500000000}]}}}}}]`
+	var dels []marketingDelivery
+	if err := json.Unmarshal([]byte(raw), &dels); err != nil {
+		t.Fatal(err)
+	}
+	plans := parseMarketingDeliveries(dels)
+	if len(plans) != 1 {
+		t.Fatalf("got %d plans", len(plans))
+	}
+	if plans[0].EndsAt != 1794790800 {
+		t.Fatalf("EndsAt = %d, want 1794790800 — the banner carries it", plans[0].EndsAt)
+	}
+	if plans[0].Priority != 101 {
+		t.Fatalf("Priority = %d, want 101", plans[0].Priority)
+	}
+}
