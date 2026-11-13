@@ -220,14 +220,14 @@ walk:
 			break walk
 		case poolUnsupportedModel:
 			// No Account's plan offers this model, so no amount of waiting or
-			// retrying will serve it. Say so instead of reporting an overload.
+			// retrying will serve it. Report it as a missing resource, not an
+			// overload, and say nothing about the pool's internals.
 			if openai {
-				writeOpenAIError(w, http.StatusBadRequest,
-					"model "+model+" is not offered by any account in the pool")
+				writeOpenAIModelNotFound(w, model)
 				return
 			}
-			writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error",
-				"model "+model+" is not offered by any account in the pool")
+			writeAnthropicError(w, http.StatusNotFound, "not_found_error",
+				"model "+clip(model, modelNameLimit)+" is not available")
 			return
 		}
 		select {

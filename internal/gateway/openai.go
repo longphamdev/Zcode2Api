@@ -813,9 +813,19 @@ func writeOpenAIError(w http.ResponseWriter, code int, msg string) {
 // Error required, and a missing key fails the ErrorResponse schema — null says
 // "unknown", absent says "malformed".
 func writeOpenAIErrorDetail(w http.ResponseWriter, status int, msg string, originCode *string) {
-	var code any
-	if originCode != nil {
-		code = *originCode
+	writeOpenAIErrorFull(w, status, msg, nil, originCode)
+}
+
+// writeOpenAIErrorFull is the full envelope: every member the spec marks
+// required, with param and code addressable so an error can point at the field
+// that caused it and carry a machine-readable code.
+func writeOpenAIErrorFull(w http.ResponseWriter, status int, msg string, param, code *string) {
+	var paramV, codeV any
+	if param != nil {
+		paramV = *param
+	}
+	if code != nil {
+		codeV = *code
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -823,7 +833,40 @@ func writeOpenAIErrorDetail(w http.ResponseWriter, status int, msg string, origi
 		"error": map[string]any{
 			"message": msg,
 			"type":    oaErrorType(status),
-			"param":   nil,
+			"param":   paramV,
+			"code":    codeV,
+		},
+	})
+}
+
+// modelNameLimit bounds the model name echoed into an error message. The name
+// comes from the client, so an unbounded echo lets a careless or hostile caller
+// inflate the error body.
+const modelNameLimit = 100
+
+// writeOpenAIModelNotFound answers a model the gateway cannot serve. It is a
+// missing resource, not a malformed request: 404 with the code OpenAI SDKs
+// branch on. No Retry-After — nothing will change, so inviting a retry would be
+// a lie.
+func writeOpenAIModelNotFound(w http.ResponseWriter, model string) {
+	if len(model) > modelNameLimit {
+		model = model[:modelNameLimit] + "…"
+	}
+	param, code := "model", "model_not_found"
+	// The message deliberately says nothing about pools or accounts: that is
+	// internal structure the caller has no business inferring.
+	//
+	// The type stays invalid_request_error rather than the not_found_error the
+	// status mapper would pick: OpenAI does not constrain type, and code is the
+	// field that distinguishes this error. Inventing a type clients never had to
+	// handle is a change with no upside.
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusNotFound)
+	json.NewEncoder(w).Encode(map[string]any{
+		"error": map[string]any{
+			"message": "model " + model + " is not available",
+			"type":    "invalid_request_error",
+			"param":   param,
 			"code":    code,
 		},
 	})

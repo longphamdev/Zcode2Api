@@ -1,6 +1,10 @@
 package gateway
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -495,5 +499,74 @@ func TestExpiredAccountsStillTestifyForModel(t *testing.T) {
 	outcome, _ := poolAvailability(accs, nil, "GLM-5.3", now, now.Add(10*time.Minute))
 	if outcome == poolUnsupportedModel {
 		t.Error("an expired account's plan proves the model exists; overload must not read as unsupported")
+	}
+}
+
+// A model the gateway cannot serve is a missing resource, not a malformed
+// request: 404 with code "model_not_found", the field OpenAI SDKs branch on.
+// It must not invite a retry — there is no Retry-After, because nothing will
+// change.
+func TestUnsupportedModelResponseContract(t *testing.T) {
+	rec := httptest.NewRecorder()
+	writeOpenAIModelNotFound(rec, "NO-SUCH-MODEL")
+
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", rec.Code)
+	}
+	if got := rec.Header().Get("Retry-After"); got != "" {
+		t.Errorf("Retry-After = %q, want absent — this error is permanent", got)
+	}
+
+	var out struct {
+		Error struct {
+			Message string  `json:"message"`
+			Type    string  `json:"type"`
+			Param   *string `json:"param"`
+			Code    *string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("body is not JSON: %v (%s)", err, rec.Body.String())
+	}
+	// The type stays invalid_request_error: OpenAI does not constrain it and
+	// "code" is the field that distinguishes this error. Inventing a new type
+	// would make clients branch on something they never had to before.
+	if out.Error.Type != "invalid_request_error" {
+		t.Errorf("type = %q, want invalid_request_error", out.Error.Type)
+	}
+	if out.Error.Code == nil || *out.Error.Code != "model_not_found" {
+		t.Errorf("code = %v, want model_not_found", out.Error.Code)
+	}
+	if out.Error.Param == nil || *out.Error.Param != "model" {
+		t.Errorf("param = %v, want \"model\"", out.Error.Param)
+	}
+	if strings.Contains(out.Error.Message, "pool") || strings.Contains(out.Error.Message, "account") {
+		t.Errorf("message leaks internal structure: %q", out.Error.Message)
+	}
+	if !strings.Contains(out.Error.Message, "NO-SUCH-MODEL") {
+		t.Errorf("message should name the model, got %q", out.Error.Message)
+	}
+}
+
+// A hostile or careless client can send an enormous model name; it must not
+// inflate the error body.
+func TestUnsupportedModelMessageIsBounded(t *testing.T) {
+	long := strings.Repeat("x", 5000)
+	rec := httptest.NewRecorder()
+	writeOpenAIModelNotFound(rec, long)
+
+	var out struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("body is not JSON: %v", err)
+	}
+	if len(out.Error.Message) > 200 {
+		t.Errorf("message length = %d, want bounded (<=200)", len(out.Error.Message))
+	}
+	if len(rec.Body.Bytes()) > 1000 {
+		t.Errorf("body = %d bytes, want bounded", len(rec.Body.Bytes()))
 	}
 }
