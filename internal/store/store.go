@@ -349,6 +349,32 @@ func (s *Store) DeadSet() map[string]bool {
 	return out
 }
 
+// DeadUntil returns each model-dead marker's expiry, keyed by account id.
+// DeadSet answers "is it dead now"; this answers "when does it stop", which is
+// what a caller deciding how long to wait needs.
+func (s *Store) DeadUntil() map[int64]int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now().Unix()
+	rows, err := s.db.Query(`SELECT account_id, until FROM dead_until WHERE until > ?`, now)
+	if err != nil {
+		return map[int64]int64{}
+	}
+	defer rows.Close()
+	out := map[int64]int64{}
+	for rows.Next() {
+		var id, until int64
+		if rows.Scan(&id, &until) == nil {
+			// An account can have several model-scoped markers; keep the
+			// earliest, since that is when some model becomes servable again.
+			if prev, ok := out[id]; !ok || until < prev {
+				out[id] = until
+			}
+		}
+	}
+	return out
+}
+
 func (s *Store) DeadCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()

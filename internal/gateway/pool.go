@@ -374,6 +374,79 @@ func (s *Server) pickExcept(model string, skip map[int64]bool) (*store.Account, 
 	return nil, fmt.Errorf("pool empty for model %s", model)
 }
 
+// shouldHold reports whether waiting for the rest of the hold window can
+// plausibly help. It cannot when nothing in the pool will recover in time: the
+// client would be held to the deadline only to be told what was already known.
+func shouldHold(recover time.Time, waiting bool, holdUntil time.Time) bool {
+	if !waiting {
+		return false
+	}
+	return !recover.After(holdUntil)
+}
+
+// modelExcluded reports whether an Account is deliberately excluded from
+// serving this model. Such an Account never recovers for it, so it must not
+// contribute a recovery time.
+func modelExcluded(a store.Account, model string) bool {
+	if a.DisabledModels == "" {
+		return false
+	}
+	mkey := upstream.Norm(model)
+	for _, dm := range strings.Split(a.DisabledModels, ",") {
+		if strings.TrimSpace(dm) == mkey {
+			return true
+		}
+	}
+	return false
+}
+
+// recoveryAt answers: if no Account can serve this model right now, when will
+// one be able to? waiting=false means either the pool is ready now, or nothing
+// in it will ever become ready for this model — neither is a wait to sit out.
+//
+// This exists so the request walk can tell "wait, help is coming" from "waiting
+// is pointless". pickExcept collapses every refusal into a nil Account, which
+// cannot distinguish an Account recovering in thirty seconds from one that
+// expired for good.
+func recoveryAt(accs []store.Account, dead map[int64]int64, model string, now time.Time) (time.Time, bool) {
+	nowUnix := now.Unix()
+	var earliest int64
+	found := false
+
+	consider := func(until int64) {
+		if until <= nowUnix {
+			return
+		}
+		if !found || until < earliest {
+			earliest = until
+			found = true
+		}
+	}
+
+	for _, a := range accs {
+		if a.Status != "" {
+			continue // expired or revoked: never recovers
+		}
+		if modelExcluded(a, model) {
+			continue // not this model's account, in any timeframe
+		}
+		if until, ok := dead[a.ID]; ok {
+			consider(until)
+			continue
+		}
+		if a.CoolingUntil > nowUnix {
+			consider(a.CoolingUntil)
+			continue
+		}
+		// Servable right now — nothing to wait for.
+		return time.Time{}, false
+	}
+	if !found {
+		return time.Time{}, false
+	}
+	return time.Unix(earliest, 0), true
+}
+
 func (s *Server) markQuotaDead(cur *store.Account, model string) {
 	if cur == nil {
 		return

@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 	"zcode2api/internal/captcha"
@@ -207,6 +208,13 @@ walk:
 		if s.cfg.RequestHold <= 0 || time.Now().After(holdUntil) {
 			break walk
 		}
+		// Holding only helps if something in the pool can recover inside the
+		// window. When the earliest recovery is further out, the client would
+		// sit here until the deadline to be told what was known at once — drop
+		// the hold and answer now.
+		if !s.poolWillRecoverInTime(model, holdUntil) {
+			break walk
+		}
 		select {
 		case <-r.Context().Done():
 			// the client hung up while we held — quiet exit, no bytes wasted
@@ -214,14 +222,49 @@ walk:
 		case <-time.After(15 * time.Second):
 		}
 	}
+	// Tell the client when to come back. Both wire formats carry the header; the
+	// OpenAI path used to omit it, leaving SDKs to invent their own backoff.
+	retryAfter := s.retryAfterSeconds(model)
 	if openai {
+		w.Header().Set("Retry-After", retryAfter)
 		writeOpenAIError(w, 529, "Overloaded")
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Retry-After", "0")
+	w.Header().Set("Retry-After", retryAfter)
 	w.WriteHeader(529)
 	w.Write(upstream.OverloadedJSON())
+}
+
+// retryAfterSeconds renders the time until this model's pool recovers as the
+// whole seconds a Retry-After header carries. Zero when nothing is recoverable:
+// a client should retry on its own schedule rather than be told a false time.
+func (s *Server) retryAfterSeconds(model string) string {
+	accs, err := s.store.Accounts()
+	if err != nil {
+		return "0"
+	}
+	recover, waiting := recoveryAt(accs, s.store.DeadUntil(), model, time.Now())
+	if !waiting {
+		return "0"
+	}
+	secs := int(time.Until(recover).Seconds())
+	if secs < 0 {
+		secs = 0
+	}
+	return strconv.Itoa(secs)
+}
+
+// poolWillRecoverInTime reports whether waiting for this model can help before
+// holdUntil. It is deliberately cheap: a pool snapshot, no origin traffic.
+func (s *Server) poolWillRecoverInTime(model string, holdUntil time.Time) bool {
+	accs, err := s.store.Accounts()
+	if err != nil {
+		return false
+	}
+	dead := s.store.DeadUntil()
+	recover, waiting := recoveryAt(accs, dead, model, time.Now())
+	return shouldHold(recover, waiting, holdUntil)
 }
 
 func (s *Server) injectDefaults(body []byte) []byte {
