@@ -114,7 +114,32 @@ func (c *Client) ClaimOfferedPlans(ctx context.Context, jwt, mid string) (string
 	if json.Unmarshal(raw, &pw) != nil || pw.Code != 0 {
 		return "", fmt.Sprintf("preview code %d", pw.Code)
 	}
-	sort.SliceStable(pw.Data.Plans, func(i, j int) bool { return pw.Data.Plans[i].Priority > pw.Data.Plans[j].Priority })
+
+	// The preview is one of two faces. A campaign may be distributed only on the
+	// marketing banner — the weekend campaign measured 2026-11-13 was exactly
+	// that, and reading the preview alone reported "nothing offered" while a
+	// claimable plan sat on the banner. Merge both, preview first and winning on
+	// a shared plan id: it carries the authoritative priority and window.
+	var plans []offeredPlan
+	for _, p := range pw.Data.Plans {
+		if p.PlanID == "" {
+			continue
+		}
+		plans = append(plans, offeredPlan{PlanID: p.PlanID, Name: p.Name, Priority: p.Priority})
+	}
+	seen := map[string]bool{}
+	for _, p := range plans {
+		seen[p.PlanID] = true
+	}
+	for _, p := range c.marketingPlans(ctx, jwt, mid) {
+		if seen[p.PlanID] {
+			continue
+		}
+		seen[p.PlanID] = true
+		plans = append(plans, p)
+	}
+
+	sort.SliceStable(plans, func(i, j int) bool { return plans[i].Priority > plans[j].Priority })
 	owned := map[string]bool{}
 	if q, err := c.Billing(jwt, mid); err == nil {
 		for _, id := range q.PlanIDs {
@@ -122,10 +147,7 @@ func (c *Client) ClaimOfferedPlans(ctx context.Context, jwt, mid string) (string
 		}
 	}
 	var claimed, problems, skipped []string
-	for _, p := range pw.Data.Plans {
-		if p.PlanID == "" {
-			continue
-		}
+	for _, p := range plans {
 		if owned[strings.ToLower(p.PlanID)] {
 			if p.Name == "" {
 				p.Name = p.PlanID

@@ -10,6 +10,7 @@ services:
     environment:
       HOST: 0.0.0.0
       PORT: 3101
+      CAPTCHA_STALL_MS: "30000"
     volumes:
       - ./data:/app/data
       # Optional seed files — uncomment if dùng:

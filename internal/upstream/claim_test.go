@@ -575,3 +575,204 @@ func (failingSolver) Solve(context.Context) (string, string, error) {
 }
 
 func (failingSolver) Close() {}
+
+// --- the marketing banner face ---------------------------------------------
+
+// bannerBody builds a marketing/touch answer in the shape the Origin sends:
+// the plan id lives on the button action, the full plan object on the
+// background. Taken from the payload measured 2026-11-13.
+func bannerBody(planID, name string, priority int) string {
+	return `{"code":0,"data":{"deliveries":[{"campaign_id":"2101141259813175296",
+		"banner":{"buttons":[
+			{"text":{"format":"","content":""},"action":{"type":"close","args":null}},
+			{"text":{"format":"","content":""},"action":{"type":"claim_zcode_plan","args":{"plan_id":"` + planID + `"}}}
+		],
+		"background":{"type":"bundle","args":{"zcode_plan":{
+			"plan_id":"` + planID + `","name":"` + name + `","priority":` + itoa(priority) + `,
+			"starts_at":1794567600,"ends_at":1794790800}}}}}]}}`
+}
+
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	var b []byte
+	for n > 0 {
+		b = append([]byte{byte('0' + n%10)}, b...)
+		n /= 10
+	}
+	return string(b)
+}
+
+// TestBannerPlanIsOfferedWhenPreviewIsEmpty — the actual bug.
+//
+// Measured production shape: preview answers {"code":0} with no data, and the
+// claimable plan exists only on the marketing banner. Before this, that
+// combination reported "nothing offered" and the plan was never claimed.
+func TestBannerPlanIsOfferedWhenPreviewIsEmpty(t *testing.T) {
+	c, stub := newStub(t, func(path string, _ map[string]any) (int, string) {
+		switch {
+		case strings.HasSuffix(path, "/billing/preview"):
+			return 200, `{"code":0,"msg":"","logid":"20261113164707d5ebdda3ed8a7e466079"}`
+		case strings.HasSuffix(path, "/marketing/touch"):
+			return 200, bannerBody("zcode-v3-start-plan-1113-wk", "ZCODE WEEKEND BUILD", 101)
+		case strings.HasSuffix(path, balancePath):
+			return 200, `{"code":0,"data":{"plans":[]}}`
+		case strings.HasSuffix(path, "/billing/claim"):
+			return 200, `{"code":0,"data":{"plan":{"plan_id":"zcode-v3-start-plan-1113-wk"}}}`
+		}
+		return 0, ""
+	})
+
+	claimed, problems := c.ClaimOfferedPlans(context.Background(), "jwt.test", "mid-test")
+
+	if problems != "" {
+		t.Fatalf("problems = %q, want none", problems)
+	}
+	if !strings.Contains(claimed, "ZCODE WEEKEND BUILD") {
+		t.Fatalf("claimed = %q; the banner-only plan was not offered", claimed)
+	}
+	claims := stub.callsTo("/billing/claim")
+	if len(claims) != 1 {
+		t.Fatalf("claim POSTed %d times, want 1", len(claims))
+	}
+	if got, _ := claims[0].Body["plan_id"].(string); got != "zcode-v3-start-plan-1113-wk" {
+		t.Errorf("plan_id = %q, want the banner's plan", got)
+	}
+}
+
+// TestBannerRequestCarriesItsHeaders — the marketing face needs its own set:
+// a device id (UUID-parsed by the Origin), the locale, the app version, and the
+// JWT when there is one.
+func TestBannerRequestCarriesItsHeaders(t *testing.T) {
+	c, stub := newStub(t, func(path string, _ map[string]any) (int, string) {
+		switch {
+		case strings.HasSuffix(path, "/billing/preview"):
+			return 200, `{"code":0}`
+		case strings.HasSuffix(path, "/marketing/touch"):
+			return 200, bannerBody("plan-x", "Plan X", 5)
+		case strings.HasSuffix(path, balancePath):
+			return 200, `{"code":0,"data":{"plans":[]}}`
+		case strings.HasSuffix(path, "/billing/claim"):
+			return 200, `{"code":0,"data":{"plan":{"plan_id":"plan-x"}}}`
+		}
+		return 0, ""
+	})
+
+	_, _ = c.ClaimOfferedPlans(context.Background(), "jwt.test", "mid-test")
+
+	calls := stub.callsTo("/marketing/touch")
+	if len(calls) != 1 {
+		t.Fatalf("marketing/touch called %d times, want 1", len(calls))
+	}
+	m := calls[0]
+	if got := m.Header.Get("X-Device-Mid"); got != "mid-test" {
+		t.Errorf("X-Device-Mid = %q, want the account's device id", got)
+	}
+	if got := m.Header.Get("X-Client-Language"); got == "" {
+		t.Error("X-Client-Language is empty; the marketing face wants a locale")
+	}
+	if got := m.Header.Get("X-ZCode-App-Version"); got != config.BillingClientVersion {
+		t.Errorf("X-ZCode-App-Version = %q, want %q", got, config.BillingClientVersion)
+	}
+	if got := m.Header.Get("Authorization"); got != "Bearer jwt.test" {
+		t.Errorf("Authorization = %q, want the account's JWT", got)
+	}
+	if got := m.Query["seq"]; got == "" {
+		t.Error("seq is missing; the banner endpoint takes a sequence number")
+	}
+}
+
+// TestPreviewWinsOnASharedPlanID — the merge rule.
+//
+// Both faces offering the same plan id must not claim it twice, and the
+// preview's priority must survive: it is the face that owns the authoritative
+// window and entitlements.
+func TestPreviewWinsOnASharedPlanID(t *testing.T) {
+	c, stub := newStub(t, func(path string, _ map[string]any) (int, string) {
+		switch {
+		case strings.HasSuffix(path, "/billing/preview"):
+			// Preview offers "shared" at priority 50.
+			return 200, `{"code":0,"data":{"plans":[{"plan_id":"shared","name":"Shared","priority":50}]}}`
+		case strings.HasSuffix(path, "/marketing/touch"):
+			// Banner offers the same id at priority 999 — must not win.
+			return 200, bannerBody("shared", "Shared banner", 999)
+		case strings.HasSuffix(path, balancePath):
+			return 200, `{"code":0,"data":{"plans":[]}}`
+		case strings.HasSuffix(path, "/billing/claim"):
+			return 200, `{"code":0,"data":{"plan":{"plan_id":"shared"}}}`
+		}
+		return 0, ""
+	})
+
+	claimed, problems := c.ClaimOfferedPlans(context.Background(), "jwt.test", "mid-test")
+	if problems != "" {
+		t.Fatalf("problems = %q", problems)
+	}
+	if claims := stub.callsTo("/billing/claim"); len(claims) != 1 {
+		t.Errorf("claim POSTed %d times for one shared plan id, want exactly 1", len(claims))
+	}
+	// The preview's name wins, proving the preview record was kept.
+	if !strings.Contains(claimed, "Shared") || strings.Contains(claimed, "Shared banner") {
+		t.Errorf("claimed = %q; the preview's record should win on a shared plan id", claimed)
+	}
+}
+
+// TestBannerFailureFallsBackToPreview — a marketing outage must never turn a
+// working preview into "no plans offered". Trading one silent failure for
+// another is the specific mistake this guards.
+func TestBannerFailureFallsBackToPreview(t *testing.T) {
+	c, _ := newStub(t, func(path string, _ map[string]any) (int, string) {
+		switch {
+		case strings.HasSuffix(path, "/billing/preview"):
+			return 200, `{"code":0,"data":{"plans":[{"plan_id":"from-preview","name":"From Preview","priority":10}]}}`
+		case strings.HasSuffix(path, "/marketing/touch"):
+			return 500, `{"code":500,"msg":"boom"}`
+		case strings.HasSuffix(path, balancePath):
+			return 200, `{"code":0,"data":{"plans":[]}}`
+		case strings.HasSuffix(path, "/billing/claim"):
+			return 200, `{"code":0,"data":{"plan":{"plan_id":"from-preview"}}}`
+		}
+		return 0, ""
+	})
+
+	claimed, problems := c.ClaimOfferedPlans(context.Background(), "jwt.test", "mid-test")
+	if problems != "" {
+		t.Errorf("problems = %q; a banner failure must not surface as a problem", problems)
+	}
+	if !strings.Contains(claimed, "From Preview") {
+		t.Errorf("claimed = %q; the preview plan must still be claimed when the banner fails", claimed)
+	}
+}
+
+// TestBannerWithoutPlanObjectStillOffers — the button id is authoritative.
+// The measured payload puts priority on the plan object, not the button, so a
+// button-only delivery cannot be ranked — but it must still be offered.
+func TestBannerWithoutPlanObjectStillOffers(t *testing.T) {
+	body := `{"code":0,"data":{"deliveries":[{"banner":{"buttons":[
+		{"action":{"type":"claim_zcode_plan","args":{"plan_id":"bare-id"}}}]}}]}}`
+	c, stub := newStub(t, func(path string, _ map[string]any) (int, string) {
+		switch {
+		case strings.HasSuffix(path, "/billing/preview"):
+			return 200, `{"code":0}`
+		case strings.HasSuffix(path, "/marketing/touch"):
+			return 200, body
+		case strings.HasSuffix(path, balancePath):
+			return 200, `{"code":0,"data":{"plans":[]}}`
+		case strings.HasSuffix(path, "/billing/claim"):
+			return 200, `{"code":0,"data":{"plan":{"plan_id":"bare-id"}}}`
+		}
+		return 0, ""
+	})
+
+	claimed, problems := c.ClaimOfferedPlans(context.Background(), "jwt.test", "mid-test")
+	if problems != "" {
+		t.Fatalf("problems = %q", problems)
+	}
+	if !strings.Contains(claimed, "bare-id") {
+		t.Errorf("claimed = %q; a button id with no plan object must still be offered", claimed)
+	}
+	if claims := stub.callsTo("/billing/claim"); len(claims) != 1 {
+		t.Errorf("claim POSTed %d times, want 1", len(claims))
+	}
+}
