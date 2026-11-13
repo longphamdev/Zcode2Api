@@ -309,42 +309,25 @@ func (s *Server) pickExcept(model string, skip map[int64]bool) (*store.Account, 
 	if len(accs) == 0 {
 		return nil, fmt.Errorf("no accounts")
 	}
-	dead := s.store.DeadSet()
+	deadUntil := s.store.DeadUntil()
 	mkey := upstream.Norm(model)
+	now := time.Now()
 	servable := func(a store.Account) bool {
 		if skip[a.ID] {
 			return false
 		}
-		if a.Status != "" {
-			return false // expired or revoked (hidden, kept in db)
-		}
-		if a.CoolingUntil > time.Now().Unix() {
-			return false // risk-control cooldown (strikes)
-		}
-		if a.DisabledModels != "" {
-			for _, dm := range strings.Split(a.DisabledModels, ",") {
-				if strings.TrimSpace(dm) == mkey {
-					return false // model manually excluded for this account
+		// The eligibility ladder is shared with recoveryAt — see
+		// accountEligibility. Its side effects stay here: skipping is per-walk
+		// state, and benching an exhausted Account is a consequence of choosing,
+		// not a rule of eligibility.
+		if accountEligibility(a, model, deadUntil, now).reason != eligibleNow {
+			if ents := entitlementsOf(a); len(ents) > 0 {
+				if frac, ok := upstream.FracFromEntitlements(ents, model); ok && frac <= 0 {
+					// quota exhausted — bench until the period resets
+					s.store.MarkDead(a.ID, mkey, upstream.DeadUntilUnix(ents, model))
 				}
 			}
-		}
-		if dead[fmt.Sprintf("%d:%s", a.ID, mkey)] {
 			return false
-		}
-		ents := entitlementsOf(a)
-		if len(ents) > 0 {
-			// the plan was scanned: serve the account only for models it
-			// offers, and only while quota remains (a planless/exhausted
-			// account is dead weight for this request)
-			frac, ok := upstream.FracFromEntitlements(ents, model)
-			if !ok {
-				return false // plan scanned, this model is not in it
-			}
-			if frac <= 0 {
-				// quota exhausted — dead until the period reset
-				s.store.MarkDead(a.ID, mkey, upstream.DeadUntilUnix(ents, model))
-				return false
-			}
 		}
 		return true
 	}
@@ -492,6 +475,67 @@ func poolAvailability(accs []store.Account, dead map[string]int64, model string,
 	}
 }
 
+// eligibilityReason classifies why an Account can or cannot serve a model.
+type eligibilityReason int
+
+const (
+	// eligibleNow: the Account can serve this model at this instant.
+	eligibleNow eligibilityReason = iota
+	// ineligibleUntil: it cannot now, but a known instant will change that
+	// (cooling, or a model-scoped dead marker). The zero time means the marker
+	// lapsed and the Account is usable.
+	ineligibleUntil
+	// ineligibleForever: nothing about this Account will make it serve this
+	// model — expired, revoked, excluded for the model, the plan lacks it, or
+	// its quota is spent.
+	ineligibleForever
+)
+
+// eligibility is the outcome of accountEligibility.
+type eligibility struct {
+	reason eligibilityReason
+	until  time.Time // meaningful only for ineligibleUntil
+}
+
+// accountEligibility decides whether an Account can serve a model, and if not,
+// why.
+//
+// This is the one place that ladder lives. It used to exist twice — in
+// pickExcept's servable() and again in recoveryAt — and the copies drifted three
+// times: plan exclusion, model-scoped dead markers, and exhausted quota were each
+// honoured by one and missed by the other. Every drift was a live bug.
+//
+// Pure: no store writes, no rotation, no skipping. Those are consequences of
+// choosing, not rules of eligibility, and they stay with the caller.
+func accountEligibility(a store.Account, model string, dead map[string]int64, now time.Time) eligibility {
+	nowUnix := now.Unix()
+	mkey := upstream.Norm(model)
+
+	if a.Status != "" {
+		return eligibility{reason: ineligibleForever} // expired or revoked
+	}
+	if modelExcluded(a, model) {
+		return eligibility{reason: ineligibleForever} // excluded for this model
+	}
+	ents := entitlementsOf(a)
+	if len(ents) > 0 {
+		frac, ok := upstream.FracFromEntitlements(ents, model)
+		if !ok {
+			return eligibility{reason: ineligibleForever} // plan lacks the model
+		}
+		if frac <= 0 {
+			return eligibility{reason: ineligibleForever} // quota spent
+		}
+	}
+	if until, ok := dead[fmt.Sprintf("%d:%s", a.ID, mkey)]; ok && until > nowUnix {
+		return eligibility{reason: ineligibleUntil, until: time.Unix(until, 0)}
+	}
+	if a.CoolingUntil > nowUnix {
+		return eligibility{reason: ineligibleUntil, until: time.Unix(a.CoolingUntil, 0)}
+	}
+	return eligibility{reason: eligibleNow}
+}
+
 // modelExcluded reports whether an Account is deliberately excluded from
 // serving this model. Such an Account never recovers for it, so it must not
 // contribute a recovery time.
@@ -519,45 +563,21 @@ func modelExcluded(a store.Account, model string) bool {
 // the same as "nothing to wait for" — a walk that just failed transiently
 // leaves the pool ready-now, and the next pass may succeed.
 func recoveryAt(accs []store.Account, dead map[string]int64, model string, now time.Time) (recover time.Time, readyNow bool, waiting bool) {
-	nowUnix := now.Unix()
-	var earliest int64
-	found := false
-
-	consider := func(until int64) {
-		if until <= nowUnix {
-			return
-		}
-		if !found || until < earliest {
-			earliest = until
-			found = true
-		}
-	}
-
+	var earliest time.Time
 	for _, a := range accs {
-		if a.Status != "" {
-			continue // expired or revoked: never recovers
+		switch e := accountEligibility(a, model, dead, now); e.reason {
+		case eligibleNow:
+			return time.Time{}, true, false
+		case ineligibleUntil:
+			if earliest.IsZero() || e.until.Before(earliest) {
+				earliest = e.until
+			}
 		}
-		if modelExcluded(a, model) {
-			continue // not this model's account, in any timeframe
-		}
-		if !planOffersModel(a, model) {
-			continue // the scanned plan does not carry this model at all
-		}
-		if until, ok := dead[fmt.Sprintf("%d:%s", a.ID, upstream.Norm(model))]; ok {
-			consider(until)
-			continue
-		}
-		if a.CoolingUntil > nowUnix {
-			consider(a.CoolingUntil)
-			continue
-		}
-		// Servable right now.
-		return time.Time{}, true, false
 	}
-	if !found {
-		return time.Time{}, false, false // hopeless: nothing will recover
+	if earliest.IsZero() {
+		return time.Time{}, false, false // hopeless
 	}
-	return time.Unix(earliest, 0), false, true
+	return earliest, false, true
 }
 
 func (s *Server) markQuotaDead(cur *store.Account, model string) {
