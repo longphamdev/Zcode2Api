@@ -593,7 +593,11 @@ func anthEventToOA(ev string, data map[string]any, id, model string, st *oaStrea
 	default:
 		return nil
 	}
-	ch := map[string]any{"index": 0, "delta": delta}
+	// The OpenAI schema marks finish_reason required (nullable) on every stream
+	// choice, so it is always present: null while the turn is still running, the
+	// real reason on the terminal chunk. Omitting it on content chunks is what
+	// strict clients reject.
+	ch := map[string]any{"index": 0, "delta": delta, "finish_reason": nil}
 	if finish != nil {
 		ch["finish_reason"] = *finish
 	}
