@@ -316,3 +316,62 @@ func TestWalkHoldDecision(t *testing.T) {
 		})
 	}
 }
+
+// A model no Account can ever serve is a request error, not a load problem.
+// Answering 529 tells the client to back off and retry, which can never succeed
+// — the pool will not grow a model it does not have.
+func TestUnknownModelIsNotOverload(t *testing.T) {
+	now := time.Now()
+	accs := []store.Account{{
+		ID:        1,
+		QuotaJSON: `[{"name":"GLM-5.3","limit":10,"remaining":10}]`,
+	}}
+
+	outcome, _ := poolAvailability(accs, nil, "NO-SUCH-MODEL", now, now.Add(10*time.Minute))
+	if outcome != poolUnsupportedModel {
+		t.Errorf("outcome = %v, want poolUnsupportedModel", outcome)
+	}
+}
+
+// A pool that is merely exhausted is still an overload: the model exists, there
+// is just nothing free right now.
+func TestExhaustedPoolIsOverloadNotUnsupported(t *testing.T) {
+	now := time.Now()
+	accs := []store.Account{{ID: 1, CoolingUntil: now.Add(30 * time.Minute).Unix()}}
+
+	outcome, _ := poolAvailability(accs, nil, "GLM-5.3", now, now.Add(10*time.Minute))
+	if outcome != poolHopeless {
+		t.Errorf("outcome = %v, want poolHopeless (overload)", outcome)
+	}
+}
+
+// Pin the exhaustion contract: an exhausted pool answers 529 with a Retry-After
+// that reflects a real recovery time, and an unknown model answers 400 rather
+// than a retryable 529. These are the two statuses a client branches on.
+func TestExhaustedPoolStatusAndRetryAfter(t *testing.T) {
+	now := time.Now()
+	holdUntil := now.Add(10 * time.Minute)
+
+	// Cooling further out than the hold: hopeless, but the model exists.
+	exhausted := []store.Account{{
+		ID:           1,
+		CoolingUntil: now.Add(30 * time.Minute).Unix(),
+		QuotaJSON:    `[{"name":"GLM-5.3","limit":10,"remaining":10}]`,
+	}}
+	outcome, recover := poolAvailability(exhausted, nil, "GLM-5.3", now, holdUntil)
+	if outcome != poolHopeless {
+		t.Fatalf("outcome = %v, want poolHopeless (overload)", outcome)
+	}
+	if got := retryAfterFrom(recover, now); got != "1800" {
+		t.Errorf("Retry-After = %q, want 1800 (the 30-minute recovery)", got)
+	}
+
+	// A model no plan carries: not an overload, and retrying cannot help.
+	unsupported := []store.Account{{
+		ID:        1,
+		QuotaJSON: `[{"name":"GLM-5.3","limit":10,"remaining":10}]`,
+	}}
+	if outcome, _ := poolAvailability(unsupported, nil, "NO-SUCH-MODEL", now, holdUntil); outcome != poolUnsupportedModel {
+		t.Errorf("outcome = %v, want poolUnsupportedModel so the caller answers 400", outcome)
+	}
+}

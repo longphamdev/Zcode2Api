@@ -395,6 +395,29 @@ func planOffersModel(a store.Account, model string) bool {
 	return frac > 0
 }
 
+// anyPlanOffersModel reports whether any Account's scanned plan carries this
+// model. An unscanned plan counts as offering it: absence of evidence is not
+// evidence the model is unsupported.
+//
+// Only Accounts whose plan was actually scanned can testify that a model does
+// not exist. An expired Account, or one whose plan was never fetched, says
+// nothing about the model — treating its silence as "unsupported" would answer
+// 400 for a model that is merely unavailable right now.
+func anyPlanOffersModel(accs []store.Account, model string) bool {
+	scanned := false
+	for _, a := range accs {
+		ents := entitlementsOf(a)
+		if len(ents) == 0 {
+			return true // unscanned: cannot rule the model out
+		}
+		scanned = true
+		if _, ok := upstream.FracFromEntitlements(ents, model); ok {
+			return true
+		}
+	}
+	return !scanned
+}
+
 // poolOutcome is what the hold decision needs to know about the Pool.
 type poolOutcome int
 
@@ -407,8 +430,12 @@ const (
 	// the hold window. Hold.
 	poolRecoveringSoon
 	// poolHopeless: nothing servable now and nothing will be inside the window.
-	// Holding is pure loss.
+	// Holding is pure loss, but the model exists — this is an overload.
 	poolHopeless
+	// poolUnsupportedModel: no Account's plan offers this model at all, so it
+	// will never be servable. Retrying cannot help; this is a request error, not
+	// a load problem.
+	poolUnsupportedModel
 )
 
 // neverRecovers reports whether the Pool can never become usable for this model
@@ -425,6 +452,13 @@ func poolAvailability(accs []store.Account, dead map[string]int64, model string,
 	case readyNow:
 		return poolReadyNow, time.Time{}
 	case !waiting:
+		// Nothing will recover. Distinguish "this model exists somewhere and is
+		// merely busy/exhausted" from "no Account has it in its plan at all" —
+		// the first is an overload the client should retry, the second never
+		// will be.
+		if len(accs) > 0 && !anyPlanOffersModel(accs, model) {
+			return poolUnsupportedModel, time.Time{}
+		}
 		return poolHopeless, time.Time{}
 	case recover.After(holdUntil):
 		return poolHopeless, recover

@@ -215,8 +215,20 @@ walk:
 		//
 		// A pool that is ready-now is NOT this case: a walk can fail transiently
 		// with every Account still healthy, and the next pass may succeed.
-		if s.poolIsHopeless(model, holdUntil) {
+		switch s.poolVerdict(model, holdUntil) {
+		case poolHopeless:
 			break walk
+		case poolUnsupportedModel:
+			// No Account's plan offers this model, so no amount of waiting or
+			// retrying will serve it. Say so instead of reporting an overload.
+			if openai {
+				writeOpenAIError(w, http.StatusBadRequest,
+					"model "+model+" is not offered by any account in the pool")
+				return
+			}
+			writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error",
+				"model "+model+" is not offered by any account in the pool")
+			return
 		}
 		select {
 		case <-r.Context().Done():
@@ -272,15 +284,17 @@ func retryAfterFrom(recover, now time.Time) string {
 	return strconv.Itoa(secs)
 }
 
-// poolIsHopeless reports whether no Account can serve this model before
-// holdUntil. Deliberately cheap: a pool snapshot, no Origin traffic.
-func (s *Server) poolIsHopeless(model string, holdUntil time.Time) bool {
+// poolVerdict reports what the Pool can do for this model right now.
+// Deliberately cheap: a pool snapshot, no Origin traffic. An unreadable pool
+// reports ready-now, because failing on a store error would answer 529 for a
+// problem the client cannot act on.
+func (s *Server) poolVerdict(model string, holdUntil time.Time) poolOutcome {
 	accs, err := s.store.Accounts()
 	if err != nil {
-		return false // an unreadable pool is not proof of hopelessness
+		return poolReadyNow
 	}
 	outcome, _ := poolAvailability(accs, s.store.DeadUntil(), model, time.Now(), holdUntil)
-	return outcome == poolHopeless
+	return outcome
 }
 
 func (s *Server) injectDefaults(body []byte) []byte {
