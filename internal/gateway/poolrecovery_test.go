@@ -839,8 +839,6 @@ func TestWalkWaitsForRecoveryInsideWindowThenServes(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("set quota: %v", err)
 	}
-	// Cooling for a brief moment, well inside the hold window.
-	db.SetCooling(acc.ID, time.Now().Add(600*time.Millisecond).Unix())
 	if err := db.Select(acc.ID); err != nil {
 		t.Fatalf("select: %v", err)
 	}
@@ -879,7 +877,19 @@ func TestWalkWaitsForRecoveryInsideWindowThenServes(t *testing.T) {
 		strings.NewReader(`{"model":"GLM-5.3","messages":[{"role":"user","content":"hi"}]}`))
 	rec := httptest.NewRecorder()
 
+	// Cooling for a brief moment, well inside the hold window. CoolingUntil is
+	// whole seconds, so a sub-second offset can truncate into the past and the
+	// Account is eligible on the first pass — the test then passes without any
+	// wait, whatever the hold decision does. now+2 is at least one full second
+	// out however the call lands within the second.
+	cooling := time.Unix(time.Now().Unix()+2, 0)
+	db.SetCooling(acc.ID, cooling.Unix())
+
 	start := time.Now()
+	remaining := cooling.Sub(start)
+	if remaining <= 0 {
+		t.Fatalf("cooldown already lapsed before the walk began (%s); the fixture is wrong", remaining)
+	}
 	srv.handleChatCompletions(rec, req)
 	elapsed := time.Since(start)
 
@@ -889,7 +899,12 @@ func TestWalkWaitsForRecoveryInsideWindowThenServes(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Errorf("status = %d, want 200 after the cooldown lapsed (body=%s)", rec.Code, rec.Body.String())
 	}
-	if elapsed > 5*time.Second {
-		t.Errorf("took %s; should serve as soon as the cooldown lapses", elapsed.Round(time.Millisecond))
+	// The walk must have actually waited the cooldown out. Without this bound a
+	// walk that never held — or that served off a stale pass — looks identical.
+	if elapsed < remaining {
+		t.Errorf("served after %s, but the cooldown had %s left; the walk did not wait", elapsed.Round(time.Millisecond), remaining.Round(time.Millisecond))
+	}
+	if elapsed > remaining+3*time.Second {
+		t.Errorf("took %s for a %s cooldown; should serve as soon as it lapses", elapsed.Round(time.Millisecond), remaining.Round(time.Millisecond))
 	}
 }
