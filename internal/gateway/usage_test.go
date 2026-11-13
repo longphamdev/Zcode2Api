@@ -142,13 +142,7 @@ func TestWriteOpenAIFromJSONEmitsUsage(t *testing.T) {
 // answered with SSE anyway, so the converter collects the events into a single
 // completion. That path has to carry usage too.
 func TestWriteOpenAIFromOriginSSECollectedEmitsUsage(t *testing.T) {
-	sse := strings.Join([]string{
-		`event: message_start` + "\n" + `data: {"type":"message_start","message":{"usage":{"input_tokens":0,"output_tokens":0}}}` + "\n\n",
-		`event: content_block_start` + "\n" + `data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}` + "\n\n",
-		`event: content_block_delta` + "\n" + `data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}` + "\n\n",
-		`event: message_delta` + "\n" + `data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":15,"output_tokens":100,"cache_read_input_tokens":1344}}` + "\n\n",
-		`event: message_stop` + "\n" + `data: {"type":"message_stop"}` + "\n\n",
-	}, "")
+	sse := usageStreamSSE()
 
 	head := []byte("event: message_start\n")
 	// Production tees the origin body (head included) into the scanner; the

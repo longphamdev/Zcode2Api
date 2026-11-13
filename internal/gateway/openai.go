@@ -265,6 +265,35 @@ func (m oaMessage) contentBlocks() []any {
 	return blocks
 }
 
+// newOAChunk builds a stream chunk envelope. The same five keys appear on every
+// chunk; only the choices and the optional usage differ.
+func newOAChunk(id, model string, choices []any, usage map[string]any) map[string]any {
+	if choices == nil {
+		choices = []any{}
+	}
+	chunk := map[string]any{
+		"id":      id,
+		"object":  "chat.completion.chunk",
+		"created": time.Now().Unix(),
+		"model":   model,
+		"choices": choices,
+	}
+	if usage != nil {
+		chunk["usage"] = usage
+	}
+	return chunk
+}
+
+// writeSSEChunk marshals one chunk and writes it as an SSE frame, flushing so
+// the client sees it immediately.
+func writeSSEChunk(w http.ResponseWriter, fl http.Flusher, chunk map[string]any) {
+	b, _ := json.Marshal(chunk)
+	fmt.Fprintf(w, "data: %s\n\n", b)
+	if fl != nil {
+		fl.Flush()
+	}
+}
+
 func (s *Server) writeOpenAIFromOrigin(w http.ResponseWriter, resp *http.Response, head []byte, rest io.ReadCloser, outModel string, stream bool, scn *usageScanner, includeUsage bool) {
 	defer resp.Body.Close()
 	id := "chatcmpl-" + util.GenerateUUID()
@@ -305,14 +334,8 @@ func (s *Server) writeOpenAIFromOrigin(w http.ResponseWriter, resp *http.Respons
 	fl, _ := w.(http.Flusher)
 	st := &oaStreamState{toolIdx: map[int]int{}}
 	err := scanAnthropicSSE(src, func(ev string, data map[string]any) {
-		chunk := anthEventToOA(ev, data, id, outModel, st)
-		if chunk == nil {
-			return
-		}
-		b, _ := json.Marshal(chunk)
-		fmt.Fprintf(w, "data: %s\n\n", b)
-		if fl != nil {
-			fl.Flush()
+		if chunk := anthEventToOA(ev, data, id, outModel, st); chunk != nil {
+			writeSSEChunk(w, fl, chunk)
 		}
 	})
 	if err != nil {
@@ -325,19 +348,7 @@ func (s *Server) writeOpenAIFromOrigin(w http.ResponseWriter, resp *http.Respons
 	// before.
 	if includeUsage {
 		if usage := oaUsage(scn.Usage()); usage != nil {
-			chunk := map[string]any{
-				"id":      id,
-				"object":  "chat.completion.chunk",
-				"created": time.Now().Unix(),
-				"model":   outModel,
-				"choices": []any{},
-				"usage":   usage,
-			}
-			b, _ := json.Marshal(chunk)
-			fmt.Fprintf(w, "data: %s\n\n", b)
-			if fl != nil {
-				fl.Flush()
-			}
+			writeSSEChunk(w, fl, newOAChunk(id, outModel, nil, usage))
 		}
 	}
 	fmt.Fprintf(w, "data: [DONE]\n\n")

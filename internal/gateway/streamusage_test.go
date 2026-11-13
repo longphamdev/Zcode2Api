@@ -144,9 +144,9 @@ func TestStreamOmitsUsageChunkWhenNotRequested(t *testing.T) {
 			t.Errorf("frame %d carries usage but the client did not ask: %v", i, f)
 		}
 	}
-	if n := len(frames); n != 3 { // content delta + finish chunk; header events produce nothing
-		t.Logf("frame count with include_usage off: %d", n)
-	}
+	// Frame count is not asserted: how many chunks the origin's events produce
+	// is the converter's business, and pinning it here would fail on an
+	// unrelated formatting change. What matters is that no usage rides along.
 }
 
 // Criterion: with the option off the stream is unchanged. Pin it structurally --
