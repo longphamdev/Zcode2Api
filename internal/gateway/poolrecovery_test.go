@@ -3,8 +3,8 @@ package gateway
 import (
 	"encoding/json"
 	"net/http"
-	"path/filepath"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
