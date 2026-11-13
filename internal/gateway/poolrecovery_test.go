@@ -3,11 +3,13 @@ package gateway
 import (
 	"encoding/json"
 	"net/http"
+	"path/filepath"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"zcode2api/internal/config"
 	"zcode2api/internal/store"
 )
 
@@ -568,5 +570,59 @@ func TestUnsupportedModelMessageIsBounded(t *testing.T) {
 	}
 	if len(rec.Body.Bytes()) > 1000 {
 		t.Errorf("body = %d bytes, want bounded", len(rec.Body.Bytes()))
+	}
+}
+
+// End-to-end through the real handler: the 404 must come out of the HTTP
+// surface, not just out of the helper. This path needs no origin — the verdict
+// is decided before anything is forwarded — so it can be tested today, without
+// the injectable client that issue #18 will bring.
+func TestChatCompletionsReturns404ForUnknownModel(t *testing.T) {
+	db, err := store.OpenStore(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	// One Account whose scanned plan carries only another model.
+	acc, err := db.Add("jwt.a", "a")
+	if err != nil {
+		t.Fatalf("add account: %v", err)
+	}
+	if err := db.UpdateQuota(acc.ID, store.Quota{
+		Remaining: 10, Limit: 10,
+		Entitlements: []map[string]any{
+			{"name": "GLM-5.3", "limit": 10, "remaining": 10},
+		},
+	}); err != nil {
+		t.Fatalf("set quota: %v", err)
+	}
+
+	srv := &Server{
+		store:   db,
+		catalog: NewCatalog(nil),
+		cfg:     config.Config{GatewayKey: "k", RequestHold: 10 * time.Minute},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"NO-SUCH-MODEL","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer k")
+	rec := httptest.NewRecorder()
+
+	srv.handleChatCompletions(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (body=%s)", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Error struct {
+			Code *string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("body is not JSON: %v (%s)", err, rec.Body.String())
+	}
+	if out.Error.Code == nil || *out.Error.Code != "model_not_found" {
+		t.Errorf("code = %v, want model_not_found", out.Error.Code)
 	}
 }
