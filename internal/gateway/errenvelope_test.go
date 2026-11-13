@@ -300,3 +300,52 @@ func TestUpstreamErrorDoesNotEchoRawBody(t *testing.T) {
 		})
 	}
 }
+
+// A 2xx whose body does not parse as a message document is not a success, and
+// its body is not ours to show. It used to be echoed into error.message under
+// the Origin's own 200 — an error envelope labelled as success, carrying
+// whatever a proxy or an error page had put there.
+func TestMalformedSuccessBodyIsBadGatewayWithoutEcho(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"html page", `<html><body>Service temporarily unavailable<br>nginx/1.24.0</body></html>`},
+		{"truncated json", `{"id":"msg_1","content":[{"type":"text","text":"internal-host-42`},
+		{"plain text", `upstream prematurely closed connection`},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			rec := origin4xxReply(t, 200, c.body)
+
+			if rec.Code != http.StatusBadGateway {
+				t.Errorf("HTTP status = %d, want 502; a body that is not a reply is not a success", rec.Code)
+			}
+			var out struct {
+				Error struct {
+					Message string `json:"message"`
+					Type    string `json:"type"`
+				} `json:"error"`
+				Choices []any `json:"choices"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+				t.Fatalf("body is not JSON: %v (%s)", err, rec.Body.String())
+			}
+			for _, leak := range []string{"nginx", "internal-host-42", "<html", "prematurely"} {
+				if strings.Contains(out.Error.Message, leak) {
+					t.Errorf("message echoes origin body (%q found): %q", leak, out.Error.Message)
+				}
+			}
+			if out.Error.Message == "" {
+				t.Error("message is empty; a client needs something readable")
+			}
+			if out.Error.Type != "api_error" {
+				t.Errorf("type = %q, want api_error", out.Error.Type)
+			}
+			if out.Choices != nil {
+				t.Error("must not carry choices")
+			}
+		})
+	}
+}

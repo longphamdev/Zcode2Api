@@ -562,7 +562,13 @@ func writeOpenAIFromJSON(w http.ResponseWriter, status int, body io.Reader, id, 
 		StopReason string `json:"stop_reason"`
 	}
 	if err := json.Unmarshal(raw, &doc); err != nil {
-		writeOpenAIError(w, status, string(raw))
+		// A success status with a body that is not a message document: a page
+		// from something in between, a truncated reply. Echoing it under the
+		// Origin's 200 handed clients an error envelope labelled as success,
+		// with whatever the body held pasted into it. The parse error names the
+		// offset, which is enough to diagnose without logging the body itself.
+		log.Printf("[openai] Origin returned %d with a body that is not a message document (%d bytes): %v", status, len(raw), err)
+		writeOpenAIError(w, http.StatusBadGateway, "origin returned a malformed response")
 		return
 	}
 	text := strings.Builder{}
