@@ -93,17 +93,9 @@ func usageFrom(t *testing.T, out map[string]any) map[string]any {
 	t.Helper()
 	u, ok := out["usage"].(map[string]any)
 	if !ok {
-		t.Fatalf("usage missing or not an object: %T (body keys: %v)", out["usage"], keysOf(out))
+		t.Fatalf("usage missing or not an object: %T (body: %v)", out["usage"], out)
 	}
 	return u
-}
-
-func keysOf(m map[string]any) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	return out
 }
 
 // The plain-JSON branch: the origin answered with a complete Anthropic message
@@ -162,7 +154,7 @@ func TestWriteOpenAIFromOriginSSECollectedEmitsUsage(t *testing.T) {
 	// Production tees the origin body (head included) into the scanner; the
 	// writer then streams from that same reader.
 	var scn usageScanner
-	tee := io.NopCloser(io.TeeReader(io.MultiReader(strings.NewReader(sse)), &scn))
+	tee := io.NopCloser(io.TeeReader(strings.NewReader(sse), &scn))
 	resp := &http.Response{StatusCode: 200, Body: tee}
 
 	rec := httptest.NewRecorder()
@@ -183,5 +175,30 @@ func TestWriteOpenAIFromOriginSSECollectedEmitsUsage(t *testing.T) {
 	choices, _ := out["choices"].([]any)
 	if len(choices) != 1 {
 		t.Fatalf("got %d choices, want 1", len(choices))
+	}
+}
+
+// Nothing measured means no usage key at all: an all-zero object would claim a
+// measurement of zero, which is the mirror of the reasoning-tokens rule.
+func TestOAUsageReturnsNilWhenNothingMeasured(t *testing.T) {
+	if got := oaUsage(Usage{}); got != nil {
+		t.Errorf("oaUsage(zero) = %v, want nil", got)
+	}
+}
+
+func TestWriteOpenAIFromJSONOmitsUsageWhenUnmeasured(t *testing.T) {
+	// An origin document with no usage field: nothing to report.
+	body := `{"id":"msg_1","type":"message","role":"assistant","stop_reason":"end_turn",` +
+		`"content":[{"type":"text","text":"hi"}]}`
+
+	var scn usageScanner
+	src := io.NopCloser(io.TeeReader(strings.NewReader(body), &scn))
+
+	rec := httptest.NewRecorder()
+	writeOpenAIFromJSON(rec, 200, src, "req-1", "glm-5.3", &scn)
+
+	out := decodeBody(t, rec)
+	if _, present := out["usage"]; present {
+		t.Errorf("usage must be omitted when nothing was measured; got %v", out["usage"])
 	}
 }

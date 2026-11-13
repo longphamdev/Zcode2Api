@@ -285,16 +285,15 @@ func (s *Server) writeOpenAIFromOrigin(w http.ResponseWriter, resp *http.Respons
 			finish = "tool_calls"
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
+		json.NewEncoder(w).Encode(withUsage(map[string]any{
 			"id":      id,
 			"object":  "chat.completion",
 			"created": time.Now().Unix(),
 			"model":   outModel,
-			"usage":   oaUsage(scn.Usage()),
 			"choices": []any{map[string]any{
 				"index": 0, "message": msg, "finish_reason": finish,
 			}},
-		})
+		}, scn.Usage()))
 		return
 	}
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
@@ -329,7 +328,13 @@ func (s *Server) writeOpenAIFromOrigin(w http.ResponseWriter, resp *http.Respons
 // completion_tokens_details is deliberately absent: the origin reports no
 // reasoning-token count, and a zero there would read as "reasoning measured,
 // none used" rather than "not measured".
+//
+// Returns nil when nothing was measured, for the same reason: an all-zero
+// object claims a measurement of zero. The caller omits the key instead.
 func oaUsage(u Usage) map[string]any {
+	if u.In == 0 && u.Out == 0 && u.CacheRead == 0 && u.CacheCreate == 0 {
+		return nil
+	}
 	prompt := u.In + u.CacheRead + u.CacheCreate
 	return map[string]any{
 		"prompt_tokens":     prompt,
@@ -339,6 +344,17 @@ func oaUsage(u Usage) map[string]any {
 			"cached_tokens": u.CacheRead,
 		},
 	}
+}
+
+// withUsage attaches the decoded usage object to an encoded completion, or
+// leaves the key out entirely when there was nothing to report. Callers build
+// their envelope as a map; this keeps the omit-empty rule in one place so the
+// two non-stream branches cannot disagree about it.
+func withUsage(body map[string]any, u Usage) map[string]any {
+	if usage := oaUsage(u); usage != nil {
+		body["usage"] = usage
+	}
+	return body
 }
 
 // writeOpenAIFromJSON converts a complete Anthropic message document (the
@@ -388,16 +404,15 @@ func writeOpenAIFromJSON(w http.ResponseWriter, status int, body io.Reader, id, 
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(map[string]any{
+	json.NewEncoder(w).Encode(withUsage(map[string]any{
 		"id":      id,
 		"object":  "chat.completion",
 		"created": time.Now().Unix(),
 		"model":   outModel,
-		"usage":   oaUsage(scn.Usage()),
 		"choices": []any{map[string]any{
 			"index": 0, "message": msg, "finish_reason": finish,
 		}},
-	})
+	}, scn.Usage()))
 }
 
 func collectAnthropic(r io.Reader) (string, []any, error) {
