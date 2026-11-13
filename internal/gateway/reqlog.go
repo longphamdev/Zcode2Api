@@ -73,6 +73,29 @@ func LogOK(mdl, acc string, status int, ok, stream bool, tFirst, tTotal time.Dur
 	})
 }
 
+// LogReject records a request the gateway answered without ever relaying a
+// reply: an overload, a model no plan offers, a captcha outage. LogOK covers
+// only the path that reached an Origin answer, so before this the whole class
+// of refusals was absent from the ring — /api/monitor reported zero requests
+// for a gateway refusing every one of them, and SuccessRate read as a clean
+// record for a pool that was answering nothing.
+//
+// A refusal counts towards the total but never towards ok: the gateway did not
+// serve the request. That means SuccessRate drops on a deployment that was
+// refusing requests all along — the figure was wrong before, and this is what
+// it looks like once refusals are counted.
+//
+// The gateway's own verdicts are logged; a malformed request (405 on a wrong
+// method, 400 on a missing model) is not, because it says nothing about the
+// pool and no operator action follows from it.
+func LogReject(mdl string, status int, stream bool, note string) {
+	rlog.Add(ReqEntry{
+		TS: time.Now(), Model: mdl, OK: false,
+		Status: status, Stream: stream,
+		ErrNote: note,
+	})
+}
+
 // Usage — token triple extracted from the SSE stream.
 type Usage struct {
 	In          int

@@ -103,6 +103,7 @@ walk:
 				}
 				if errors.Is(err, captcha.ErrCaptchaUnavailable) {
 					log.Printf("<< captcha unavailable %s: %v", maskJWT(acc.JWT), err)
+					LogReject(model, http.StatusServiceUnavailable, ParseStream(body), "captcha solver unavailable")
 					w.Header().Set("Content-Type", "application/json")
 					w.Header().Set("Retry-After", "5")
 					if openai {
@@ -220,6 +221,7 @@ walk:
 		if verdict == poolUnsupportedModel {
 			// No amount of waiting or retrying will serve it. Say nothing about
 			// the pool's internals.
+			LogReject(model, http.StatusNotFound, ParseStream(body), "model not offered by any plan")
 			if openai {
 				writeOpenAIModelNotFound(w, model)
 				return
@@ -257,6 +259,11 @@ walk:
 	if retryAfter := retryAfterFrom(recoverAt, time.Now()); retryAfter != "" {
 		w.Header().Set("Retry-After", retryAfter)
 	}
+	// The one place the pool says no, and until now the one that left no trace:
+	// no ring entry and no log line, so an overload was invisible on the
+	// dashboard and could not be counted afterwards.
+	LogReject(model, 529, ParseStream(body), "overloaded")
+	log.Printf("<< 529 overload model=%s retry_after=%q", model, w.Header().Get("Retry-After"))
 	if openai {
 		writeOpenAIError(w, 529, "Overloaded")
 		return

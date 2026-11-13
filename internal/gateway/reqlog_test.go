@@ -1,8 +1,15 @@
 package gateway
 
 import (
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"zcode2api/internal/config"
+	"zcode2api/internal/store"
 )
 
 // The origin reports cache counters on message_delta, not on message_start:
@@ -163,5 +170,141 @@ func TestUsageScannerJSONFallbackReadsCache(t *testing.T) {
 	}
 	if got.In != 11 || got.Out != 4 {
 		t.Errorf("In/Out = %d/%d, want 11/4", got.In, got.Out)
+	}
+}
+
+// A refused request used to leave no trace at all: LogOK had one call site, on
+// the path that reached an Origin reply, so the overload, the unsupported model
+// and the captcha outage answered the client and vanished. /api/monitor
+// reported zero requests for a gateway refusing every one of them, and
+// SuccessRate — ok over total — read as a clean record for a pool serving
+// nothing, because refused requests never entered the total.
+//
+// Driven through the real handlers rather than by calling LogReject: the bug
+// was the missing call, so a test that calls the function directly would pass
+// with every call site deleted.
+func TestRefusedRequestsReachTheMonitor(t *testing.T) {
+	expiredPool := func(t *testing.T) *Server {
+		t.Helper()
+		db, err := store.OpenStore(filepath.Join(t.TempDir(), "t.db"))
+		if err != nil {
+			t.Fatalf("open store: %v", err)
+		}
+		t.Cleanup(func() { _ = db.Close() })
+		acc, err := db.Add("jwt.a", "a")
+		if err != nil {
+			t.Fatalf("add account: %v", err)
+		}
+		// Expired, but its scanned plan carries the model: an overload, not a
+		// 404, and nothing will recover.
+		if err := db.UpdateQuota(acc.ID, store.Quota{
+			Remaining: 10, Limit: 10,
+			Entitlements: []map[string]any{{"name": "GLM-5.3", "limit": 10, "remaining": 10}},
+		}); err != nil {
+			t.Fatalf("set quota: %v", err)
+		}
+		db.SetStatusByID(acc.ID, "expired")
+		return &Server{
+			store: db, catalog: NewCatalog(nil),
+			stickyAcc: map[string]int64{}, quota1005: map[string]int{}, chatOK: map[int64]time.Time{},
+			cfg: config.Config{RequestHold: 0, AccountMaxTry: 1},
+		}
+	}
+
+	cases := []struct {
+		name   string
+		path   string
+		handle func(s *Server, w http.ResponseWriter, r *http.Request)
+		body   string
+		status int
+	}{
+		{
+			name: "overload, openai", path: "/v1/chat/completions",
+			handle: (*Server).handleChatCompletions,
+			body:   `{"model":"GLM-5.3","messages":[{"role":"user","content":"hi"}]}`,
+			status: 529,
+		},
+		{
+			name: "overload, anthropic", path: "/v1/messages",
+			handle: (*Server).handleMessages,
+			body:   `{"model":"GLM-5.3","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`,
+			status: 529,
+		},
+		{
+			// The plan is scanned and does not carry this model: 404, and the
+			// client is not invited to retry.
+			name: "model no plan offers", path: "/v1/chat/completions",
+			handle: (*Server).handleChatCompletions,
+			body:   `{"model":"NO-SUCH-MODEL","messages":[{"role":"user","content":"hi"}]}`,
+			status: 404,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			srv := expiredPool(t)
+			before := monitor()
+
+			rec := httptest.NewRecorder()
+			c.handle(srv, rec, httptest.NewRequest(http.MethodPost, c.path, strings.NewReader(c.body)))
+
+			if rec.Code != c.status {
+				t.Fatalf("status = %d, want %d (body=%s)", rec.Code, c.status, rec.Body.String())
+			}
+			after := monitor()
+			if got := after.Requests - before.Requests; got != 1 {
+				t.Fatalf("the refusal added %d requests to the log, want 1 — the client got a %d "+
+					"and the monitor knows nothing about it", got, rec.Code)
+			}
+			if len(after.Recent) == 0 {
+				t.Fatal("no recent entry recorded")
+			}
+			e := after.Recent[0]
+			if e.Status != c.status {
+				t.Errorf("logged status = %d, want the %d the client got", e.Status, c.status)
+			}
+			if e.OK {
+				t.Error("a refusal was logged as ok")
+			}
+			if e.ErrNote == "" {
+				t.Error("no reason recorded; an operator cannot tell an overload from a missing model")
+			}
+			// A refusal must never inflate the success rate. Before the fix the
+			// denominator excluded it, so the figure stayed at whatever the
+			// served requests were.
+			if after.SuccessRate > before.SuccessRate {
+				t.Errorf("SuccessRate rose from %.2f to %.2f after a refusal; a refused request "+
+					"cannot be a success", before.SuccessRate, after.SuccessRate)
+			}
+		})
+	}
+}
+
+// A malformed request is not the gateway's verdict about the pool, and no
+// operator action follows from it: it must not pollute the ring that
+// SuccessRate is computed from.
+func TestMalformedRequestIsNotLoggedAsARejection(t *testing.T) {
+	db, err := store.OpenStore(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	srv := &Server{
+		store: db, catalog: NewCatalog(nil),
+		stickyAcc: map[string]int64{}, quota1005: map[string]int{}, chatOK: map[int64]time.Time{},
+		cfg: config.Config{RequestHold: 0, AccountMaxTry: 1},
+	}
+	before := monitor()
+	// A body that is not JSON at all: the OpenAI converter refuses it before
+	// any account is considered.
+	rec := httptest.NewRecorder()
+	srv.handleChatCompletions(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`not json at all`)))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if got := monitor().Requests - before.Requests; got != 0 {
+		t.Errorf("a malformed body added %d to the log; it is the client's mistake, "+
+			"not a pool verdict", got)
 	}
 }
