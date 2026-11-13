@@ -405,6 +405,23 @@ var ErrPhaseBlocked = fmt.Errorf("waf phase: %w", ErrLoadBlocked)
 // (sticky proxy, rotating on load verdicts and dead proxies), a fresh
 // single-use captcha param per attempt (minted direct from this host).
 func (c *Client) PostMessages(ctx context.Context, jwt, deviceMid string, body []byte, extra http.Header) (*http.Response, error) {
+	return c.postMessages(ctx, jwt, deviceMid, body, extra, c.Cfg.LoadSwaps)
+}
+
+// PostMessagesWithMinSwaps is PostMessages with the egress-rotation budget raised
+// to at least minSwaps: the debug ping wants two rotations even when the
+// deployment configured fewer.
+//
+// A method rather than a copy of the Client, deliberately. Client carries two
+// mutex-guarded maps — the cached egress clients and the benched lines — and a
+// struct copy forks the mutexes while the maps stay shared by pointer, so one
+// map would end up behind two locks that know nothing about each other.
+func (c *Client) PostMessagesWithMinSwaps(ctx context.Context, jwt, deviceMid string, body []byte, extra http.Header, minSwaps int) (*http.Response, error) {
+	loadSwaps := max(c.Cfg.LoadSwaps, minSwaps)
+	return c.postMessages(ctx, jwt, deviceMid, body, extra, loadSwaps)
+}
+
+func (c *Client) postMessages(ctx context.Context, jwt, deviceMid string, body []byte, extra http.Header, loadSwaps int) (*http.Response, error) {
 	// (nil, nil) is forbidden by every audited return path, yet a live
 	// panic trace (2026-10-08 13:11, current build) saw one reach
 	// routeAnthropic. ret() names the exact return line if it ever happens
@@ -416,7 +433,6 @@ func (c *Client) PostMessages(ctx context.Context, jwt, deviceMid string, body [
 		}
 		return r, e
 	}
-	loadSwaps := c.Cfg.LoadSwaps
 	var exclude *url.URL
 	busy := 0        // 3010 admission-limit busy-retries (same egress)
 	raRetries := 0   // plain-429 Retry-After in-place retries

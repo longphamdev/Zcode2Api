@@ -98,15 +98,13 @@ func (s *Server) apiDebugPing(w http.ResponseWriter, r *http.Request) {
 	if strings.TrimSpace(req.Beta) != "" {
 		beta = strings.TrimSpace(req.Beta)
 	}
-	up := *s.up
-	if up.Cfg.LoadSwaps < 2 {
-		up.Cfg.LoadSwaps = 2
-	}
 	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
 	defer cancel()
 	t0 := time.Now()
 	extra := http.Header{"anthropic-beta": []string{beta}}
-	resp, err := up.PostMessages(ctx, acc.JWT, acc.DeviceMid, payload, extra)
+	// Two rotations whatever the deployment configured, without copying the
+	// Client — a copy forks its mutexes while the maps they guard stay shared.
+	resp, err := s.up.PostMessagesWithMinSwaps(ctx, acc.JWT, acc.DeviceMid, payload, extra, 2)
 	dt := time.Since(t0).Round(time.Millisecond)
 	out := map[string]any{
 		"ok":      false,
