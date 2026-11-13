@@ -251,9 +251,23 @@ func (s *Server) retryAfterSeconds(model string) string {
 	if !waiting {
 		return "0"
 	}
-	secs := int(time.Until(recover).Seconds())
-	if secs < 0 {
-		secs = 0
+	return retryAfterFrom(recover, time.Now())
+}
+
+// retryAfterFrom renders the wait until recover as whole seconds, rounding UP.
+// Rounding down would report "0" for a recovery still in the future, and a
+// client told zero retries immediately into the same closed pool.
+func retryAfterFrom(recover, now time.Time) string {
+	if recover.IsZero() {
+		return "0"
+	}
+	d := recover.Sub(now)
+	if d <= 0 {
+		return "0"
+	}
+	secs := int(d / time.Second)
+	if d%time.Second != 0 {
+		secs++
 	}
 	return strconv.Itoa(secs)
 }

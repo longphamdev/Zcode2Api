@@ -386,8 +386,13 @@ func planOffersModel(a store.Account, model string) bool {
 	if len(ents) == 0 {
 		return true // plan never scanned: not evidence of exclusion
 	}
-	_, ok := upstream.FracFromEntitlements(ents, model)
-	return ok
+	frac, ok := upstream.FracFromEntitlements(ents, model)
+	if !ok {
+		return false // model not in the scanned plan
+	}
+	// Exhausted quota is not a wait either: pickExcept refuses it, and the reset
+	// is a billing period away, not a hold window.
+	return frac > 0
 }
 
 // poolOutcome is what the hold decision needs to know about the Pool.
