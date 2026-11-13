@@ -261,14 +261,14 @@ func (m oaMessage) contentBlocks() []any {
 	return blocks
 }
 
-func (s *Server) writeOpenAIFromOrigin(w http.ResponseWriter, resp *http.Response, head []byte, rest io.ReadCloser, outModel string, stream bool) {
+func (s *Server) writeOpenAIFromOrigin(w http.ResponseWriter, resp *http.Response, head []byte, rest io.ReadCloser, outModel string, stream bool, scn *usageScanner) {
 	defer resp.Body.Close()
 	id := "chatcmpl-" + util.GenerateUUID()
 	// rest (the wrapped resp.Body) already starts with head — head feeds
 	// detection only, never the byte stream
 	if !upstream.IsSSE(head) {
 		// non-stream upstream: a complete Anthropic message JSON — convert it
-		writeOpenAIFromJSON(w, resp.StatusCode, rest, id, outModel)
+		writeOpenAIFromJSON(w, resp.StatusCode, rest, id, outModel, scn)
 		return
 	}
 	src := rest
@@ -290,6 +290,7 @@ func (s *Server) writeOpenAIFromOrigin(w http.ResponseWriter, resp *http.Respons
 			"object":  "chat.completion",
 			"created": time.Now().Unix(),
 			"model":   outModel,
+			"usage":   oaUsage(scn.Usage()),
 			"choices": []any{map[string]any{
 				"index": 0, "message": msg, "finish_reason": finish,
 			}},
@@ -320,9 +321,29 @@ func (s *Server) writeOpenAIFromOrigin(w http.ResponseWriter, resp *http.Respons
 	}
 }
 
+// oaUsage renders a scanned Anthropic usage triple as the OpenAI `usage`
+// object. Anthropic reports input_tokens with the cached prompt tokens
+// excluded, while OpenAI's prompt_tokens means every token in the prompt, so
+// the cache counters are summed in — once, not again in total_tokens.
+//
+// completion_tokens_details is deliberately absent: the origin reports no
+// reasoning-token count, and a zero there would read as "reasoning measured,
+// none used" rather than "not measured".
+func oaUsage(u Usage) map[string]any {
+	prompt := u.In + u.CacheRead + u.CacheCreate
+	return map[string]any{
+		"prompt_tokens":     prompt,
+		"completion_tokens": u.Out,
+		"total_tokens":      prompt + u.Out,
+		"prompt_tokens_details": map[string]any{
+			"cached_tokens": u.CacheRead,
+		},
+	}
+}
+
 // writeOpenAIFromJSON converts a complete Anthropic message document (the
 // origin's non-stream reply) into an OpenAI chat.completion.
-func writeOpenAIFromJSON(w http.ResponseWriter, status int, body io.Reader, id, outModel string) {
+func writeOpenAIFromJSON(w http.ResponseWriter, status int, body io.Reader, id, outModel string, scn *usageScanner) {
 	raw, err := io.ReadAll(io.LimitReader(body, 8<<20))
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadGateway, "read origin response: "+err.Error())
@@ -372,6 +393,7 @@ func writeOpenAIFromJSON(w http.ResponseWriter, status int, body io.Reader, id, 
 		"object":  "chat.completion",
 		"created": time.Now().Unix(),
 		"model":   outModel,
+		"usage":   oaUsage(scn.Usage()),
 		"choices": []any{map[string]any{
 			"index": 0, "message": msg, "finish_reason": finish,
 		}},

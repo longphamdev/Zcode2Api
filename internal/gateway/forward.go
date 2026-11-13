@@ -197,7 +197,7 @@ walk:
 				Closer: resp.Body,
 			}
 			if openai {
-				s.writeOpenAIFromOrigin(w, resp, head, resp.Body, model, ParseStream(body))
+				s.writeOpenAIFromOrigin(w, resp, head, resp.Body, model, ParseStream(body), scn)
 			} else {
 				copyOrigin(w, resp, head)
 			}

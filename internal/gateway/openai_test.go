@@ -180,7 +180,8 @@ func TestWriteOpenAIFromJSONKeepsToolUse(t *testing.T) {
 	}`
 
 	rec := httptest.NewRecorder()
-	writeOpenAIFromJSON(rec, 200, strings.NewReader(body), "req-1", "glm-5.3")
+	var scn usageScanner
+	writeOpenAIFromJSON(rec, 200, strings.NewReader(body), "req-1", "glm-5.3", &scn)
 
 	var out struct {
 		Choices []struct {
@@ -241,7 +242,8 @@ func TestWriteOpenAIFromJSONEmptyArgumentsDefaultsToObject(t *testing.T) {
 		"content":[{"type":"tool_use","id":"call_a","name":"ping"}]}`
 
 	rec := httptest.NewRecorder()
-	writeOpenAIFromJSON(rec, 200, strings.NewReader(body), "req-1", "glm-5.3")
+	var scn usageScanner
+	writeOpenAIFromJSON(rec, 200, strings.NewReader(body), "req-1", "glm-5.3", &scn)
 
 	if !strings.Contains(rec.Body.String(), `"arguments":"{}"`) {
 		t.Fatalf("expected empty arguments to default to {}, body=%s", rec.Body.String())
