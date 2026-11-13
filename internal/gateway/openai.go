@@ -690,11 +690,31 @@ func anthEventToOA(ev string, data map[string]any, id, model string, st *oaStrea
 	}
 }
 
+// oaErrorType maps an HTTP status to the error.type OpenAI clients branch on.
+// A single string for every status makes that branch unusable, and 401 vs 400
+// matters: one says "your key is wrong", the other "your request is wrong".
+func oaErrorType(code int) string {
+	switch code {
+	case 401:
+		return "authentication_error"
+	case 403:
+		return "permission_error"
+	case 404:
+		return "not_found_error"
+	case 429:
+		return "rate_limit_error"
+	}
+	if code >= 400 && code < 500 {
+		return "invalid_request_error"
+	}
+	return "api_error"
+}
+
 func writeOpenAIError(w http.ResponseWriter, code int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(map[string]any{
-		"error": map[string]any{"message": msg, "type": "api_error"},
+		"error": map[string]any{"message": msg, "type": oaErrorType(code)},
 	})
 }
 
