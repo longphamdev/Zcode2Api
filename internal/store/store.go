@@ -349,27 +349,29 @@ func (s *Store) DeadSet() map[string]bool {
 	return out
 }
 
-// DeadUntil returns each model-dead marker's expiry, keyed by account id.
-// DeadSet answers "is it dead now"; this answers "when does it stop", which is
-// what a caller deciding how long to wait needs.
-func (s *Store) DeadUntil() map[int64]int64 {
+// DeadUntil returns each model-dead marker's expiry, keyed "accountID:modelNorm"
+// — the same key shape DeadSet uses. DeadSet answers "is it dead now"; this
+// answers "when does it stop", which is what a caller deciding how long to wait
+// needs.
+//
+// The model is part of the key on purpose: a marker is scoped to one model, and
+// collapsing it per account would report another model's early recovery as this
+// one's.
+func (s *Store) DeadUntil() map[string]int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now().Unix()
-	rows, err := s.db.Query(`SELECT account_id, until FROM dead_until WHERE until > ?`, now)
+	rows, err := s.db.Query(`SELECT account_id, model_norm, until FROM dead_until WHERE until > ?`, now)
 	if err != nil {
-		return map[int64]int64{}
+		return map[string]int64{}
 	}
 	defer rows.Close()
-	out := map[int64]int64{}
+	out := map[string]int64{}
 	for rows.Next() {
 		var id, until int64
-		if rows.Scan(&id, &until) == nil {
-			// An account can have several model-scoped markers; keep the
-			// earliest, since that is when some model becomes servable again.
-			if prev, ok := out[id]; !ok || until < prev {
-				out[id] = until
-			}
+		var m string
+		if rows.Scan(&id, &m, &until) == nil {
+			out[fmt.Sprintf("%d:%s", id, m)] = until
 		}
 	}
 	return out

@@ -398,7 +398,7 @@ const (
 // makes every transient failure — a 429 the egress walk already absorbed, a 5xx
 // — end the hold immediately, which is the behaviour this change must not
 // introduce.
-func poolAvailability(accs []store.Account, dead map[int64]int64, model string, now, holdUntil time.Time) (poolOutcome, time.Time) {
+func poolAvailability(accs []store.Account, dead map[string]int64, model string, now, holdUntil time.Time) (poolOutcome, time.Time) {
 	recover, readyNow, waiting := recoveryAt(accs, dead, model, now)
 	switch {
 	case readyNow:
@@ -438,7 +438,7 @@ func modelExcluded(a store.Account, model string) bool {
 // It reports readyNow when some Account can serve this instant, which is not
 // the same as "nothing to wait for" — a walk that just failed transiently
 // leaves the pool ready-now, and the next pass may succeed.
-func recoveryAt(accs []store.Account, dead map[int64]int64, model string, now time.Time) (recover time.Time, readyNow bool, waiting bool) {
+func recoveryAt(accs []store.Account, dead map[string]int64, model string, now time.Time) (recover time.Time, readyNow bool, waiting bool) {
 	nowUnix := now.Unix()
 	var earliest int64
 	found := false
@@ -460,7 +460,7 @@ func recoveryAt(accs []store.Account, dead map[int64]int64, model string, now ti
 		if modelExcluded(a, model) {
 			continue // not this model's account, in any timeframe
 		}
-		if until, ok := dead[a.ID]; ok {
+		if until, ok := dead[fmt.Sprintf("%d:%s", a.ID, upstream.Norm(model))]; ok {
 			consider(until)
 			continue
 		}

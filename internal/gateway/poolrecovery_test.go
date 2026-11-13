@@ -57,7 +57,7 @@ func TestRecoveryAtAllExpiredIsNotAWait(t *testing.T) {
 func TestRecoveryAtRespectsDeadMarker(t *testing.T) {
 	now := time.Now()
 	accs := []store.Account{{ID: 1}}
-	dead := map[int64]int64{1: now.Add(20 * time.Minute).Unix()}
+	dead := map[string]int64{"1:glm53": now.Add(20 * time.Minute).Unix()}
 
 	until, _, waiting := recoveryAt(accs, dead, "GLM-5.3", now)
 	if !waiting {
@@ -104,7 +104,7 @@ func TestPoolOutcomeDistinguishesServableFromHopeless(t *testing.T) {
 	cases := []struct {
 		name string
 		accs []store.Account
-		dead map[int64]int64
+		dead map[string]int64
 		want poolOutcome
 	}{
 		{
@@ -141,5 +141,26 @@ func TestPoolOutcomeDistinguishesServableFromHopeless(t *testing.T) {
 				t.Errorf("outcome = %v, want %v", got, c.want)
 			}
 		})
+	}
+}
+
+// A model-dead marker is scoped to one model. An Account dead for 20 minutes on
+// a long-scope model but 2 minutes on another must not report the 2-minute
+// recovery to a request for the long-scope model — that would hold a window it
+// cannot recover in, and advertise a false Retry-After.
+func TestRecoveryAtIgnoresOtherModelsDeadMarkers(t *testing.T) {
+	now := time.Now()
+	accs := []store.Account{{ID: 1}}
+	dead := map[string]int64{
+		"1:glm53":      now.Add(20 * time.Minute).Unix(),
+		"1:glm53flash": now.Add(2 * time.Minute).Unix(),
+	}
+
+	until, _, waiting := recoveryAt(accs, dead, "GLM-5.3", now)
+	if !waiting {
+		t.Fatal("a model-dead account should report a wait for that model")
+	}
+	if d := until.Sub(now); d < 19*time.Minute {
+		t.Errorf("recovery in %s for glm53, want ~20m — another model's marker leaked in", d)
 	}
 }
