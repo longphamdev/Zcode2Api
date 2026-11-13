@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -376,6 +377,15 @@ func (s *Server) writeOpenAIFromOrigin(w http.ResponseWriter, resp *http.Respons
 	id := "chatcmpl-" + util.GenerateUUID()
 	// rest (the wrapped resp.Body) already starts with head — head feeds
 	// detection only, never the byte stream
+	//
+	// The status decides the shape of the answer, before the body is read as a
+	// reply. Testing parseability instead is what turned an Origin error into a
+	// fabricated chat.completion carrying an error status.
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		raw, _ := io.ReadAll(io.LimitReader(rest, 8<<20))
+		writeOpenAIFromUpstreamError(w, resp.StatusCode, raw)
+		return
+	}
 	if !upstream.IsSSE(head) {
 		// non-stream upstream: a complete Anthropic message JSON — convert it
 		writeOpenAIFromJSON(w, resp.StatusCode, rest, id, outModel, scn)
@@ -469,6 +479,60 @@ func withUsage(body map[string]any, u Usage) map[string]any {
 		body["usage"] = usage
 	}
 	return body
+}
+
+// writeOpenAIFromUpstreamError renders an Origin error reply as an OpenAI error
+// envelope. The Origin answers errors in Anthropic shape —
+// {"type":"error","error":{"type":"...","code":"1213","message":"..."}} — so the
+// code and message are lifted out of that nest when present, and the status is
+// whatever the Origin chose.
+//
+// This runs *before* any attempt to read the body as a completion: deciding on
+// parseability instead is what produced a fabricated chat.completion attached to
+// an HTTP 400.
+func writeOpenAIFromUpstreamError(w http.ResponseWriter, status int, raw []byte) {
+	var doc struct {
+		Error *struct {
+			// The Origin sends code as a string ("1213"), but other upstreams
+			// send a number. Accept either rather than silently losing it.
+			Code    json.RawMessage `json:"code"`
+			Message string          `json:"message"`
+		} `json:"error"`
+	}
+	_ = json.Unmarshal(raw, &doc)
+
+	msg := "upstream request failed"
+	var code *string
+	if doc.Error != nil {
+		if doc.Error.Message != "" {
+			msg = doc.Error.Message
+		}
+		if c := rawScalarString(doc.Error.Code); c != "" {
+			code = &c
+		}
+	}
+	if doc.Error == nil && len(bytes.TrimSpace(raw)) > 0 {
+		// Not the shape we expected; keep a readable trace rather than dropping it.
+		msg = "upstream request failed: " + clip(string(raw), 200)
+	}
+	writeOpenAIErrorDetail(w, status, msg, code)
+}
+
+// rawScalarString renders a JSON string or number as a plain string, and
+// anything else as "". Upstream error codes arrive as either type.
+func rawScalarString(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return s
+	}
+	var n json.Number
+	if json.Unmarshal(raw, &n) == nil {
+		return n.String()
+	}
+	return ""
 }
 
 // writeOpenAIFromJSON converts a complete Anthropic message document (the
@@ -711,10 +775,30 @@ func oaErrorType(code int) string {
 }
 
 func writeOpenAIError(w http.ResponseWriter, code int, msg string) {
+	writeOpenAIErrorDetail(w, code, msg, nil)
+}
+
+// writeOpenAIErrorDetail is writeOpenAIError with the Origin's own error code
+// carried through, so a client can tell "the origin rejected the request with
+// 1213" from a generic gateway string.
+//
+// param and code are always present: the bundled spec marks all four members of
+// Error required, and a missing key fails the ErrorResponse schema — null says
+// "unknown", absent says "malformed".
+func writeOpenAIErrorDetail(w http.ResponseWriter, status int, msg string, originCode *string) {
+	var code any
+	if originCode != nil {
+		code = *originCode
+	}
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
+	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(map[string]any{
-		"error": map[string]any{"message": msg, "type": oaErrorType(code)},
+		"error": map[string]any{
+			"message": msg,
+			"type":    oaErrorType(status),
+			"param":   nil,
+			"code":    code,
+		},
 	})
 }
 
