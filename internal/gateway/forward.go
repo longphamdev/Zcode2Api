@@ -251,26 +251,36 @@ walk:
 	// Tell the client when to come back. Both wire formats carry the header; the
 	// OpenAI path used to omit it, leaving SDKs to invent their own backoff. The
 	// figure comes from the same pool snapshot as the verdict that ended the
-	// walk, so the two cannot disagree. Zero when nothing is recoverable: a
-	// client should retry on its own schedule rather than be told a false time.
-	retryAfter := retryAfterFrom(recoverAt, time.Now())
-	if openai {
+	// walk, so the two cannot disagree. When there is no figure — nothing
+	// recovers, or the hold ran out with the pool merely busy — the header is
+	// left out: "0" would mean "retry now", and a made-up number is worse.
+	if retryAfter := retryAfterFrom(recoverAt, time.Now()); retryAfter != "" {
 		w.Header().Set("Retry-After", retryAfter)
+	}
+	if openai {
 		writeOpenAIError(w, 529, "Overloaded")
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Retry-After", retryAfter)
 	w.WriteHeader(529)
 	w.Write(upstream.OverloadedJSON())
 }
 
-// retryAfterFrom renders the wait until recover as whole seconds, rounding UP.
-// Rounding down would report "0" for a recovery still in the future, and a
-// client told zero retries immediately into the same closed pool.
+// retryAfterMax bounds the Retry-After the gateway advertises. A quota period
+// end can be weeks out, and the no-period_end fallback is a day the gateway made
+// up; telling a client to stay away that long outlives the usual recovery (an
+// operator adds an Account, a cooldown is lifted). Past an hour the header means
+// "poll hourly" — a retry into a hopeless pool costs one pool read and no
+// Origin traffic — not "sleep until the reset".
+const retryAfterMax = 3600
+
+// retryAfterFrom renders the wait until recover as whole seconds, rounding UP:
+// rounding down would report "0" for a recovery still in the future, and a
+// client told zero retries immediately into the same closed pool. Empty when
+// there is no recovery to wait for, "0" when the known one has already passed.
 func retryAfterFrom(recover, now time.Time) string {
 	if recover.IsZero() {
-		return "0"
+		return ""
 	}
 	d := recover.Sub(now)
 	if d <= 0 {
@@ -280,7 +290,7 @@ func retryAfterFrom(recover, now time.Time) string {
 	if d%time.Second != 0 {
 		secs++
 	}
-	return strconv.Itoa(secs)
+	return strconv.Itoa(min(secs, retryAfterMax))
 }
 
 // poolVerdict reports what the Pool can do for this model right now, and when

@@ -235,6 +235,13 @@ func TestRetryAfterRoundsUp(t *testing.T) {
 		{"just over a second", now.Add(1100 * time.Millisecond), "2"},
 		{"whole seconds", now.Add(30 * time.Second), "30"},
 		{"already past", now.Add(-5 * time.Second), "0"},
+		{"no recovery known", time.Time{}, ""},
+		// The cap: an hour reads as "poll hourly", and a month-long reset or
+		// the made-up 24-hour fallback must not be advertised literally.
+		{"half an hour is itself", now.Add(30 * time.Minute), "1800"},
+		{"an hour is the cap", now.Add(time.Hour), "3600"},
+		{"just under an hour rounds up to the cap", now.Add(time.Hour - 500*time.Millisecond), "3600"},
+		{"a month is capped", now.Add(30 * 24 * time.Hour), "3600"},
 	}
 
 	for _, c := range cases {
@@ -247,8 +254,9 @@ func TestRetryAfterRoundsUp(t *testing.T) {
 }
 
 // Hopeless pools have no recovery to advertise. Sending a made-up figure would
-// have clients back off against a number nobody measured.
-func TestRetryAfterIsZeroWhenHopeless(t *testing.T) {
+// have clients back off against a number nobody measured, and "0" is not
+// neutral either: it means "retry now".
+func TestRetryAfterIsAbsentWhenHopeless(t *testing.T) {
 	now := time.Now()
 	accs := []store.Account{{ID: 1, Status: "expired"}}
 
@@ -256,8 +264,64 @@ func TestRetryAfterIsZeroWhenHopeless(t *testing.T) {
 	if outcome != poolHopeless {
 		t.Fatalf("outcome = %v, want poolHopeless", outcome)
 	}
-	if got := retryAfterFrom(recover, now); got != "0" {
-		t.Errorf("retryAfterFrom on a hopeless pool = %q, want \"0\" (nothing recoverable)", got)
+	if got := retryAfterFrom(recover, now); got != "" {
+		t.Errorf("retryAfterFrom on a hopeless pool = %q, want none (nothing recoverable)", got)
+	}
+}
+
+// Through the real handler: a 529 with nothing to wait for carries no
+// Retry-After at all, on either wire format.
+func TestOverloadWithoutRecoveryOmitsRetryAfter(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		path   string
+		handle func(s *Server, w http.ResponseWriter, r *http.Request)
+	}{
+		{"openai", "/v1/chat/completions", (*Server).handleChatCompletions},
+		{"anthropic", "/v1/messages", (*Server).handleMessages},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			db, err := store.OpenStore(filepath.Join(t.TempDir(), "t.db"))
+			if err != nil {
+				t.Fatalf("open store: %v", err)
+			}
+			t.Cleanup(func() { _ = db.Close() })
+			// Expired, but its scanned plan proves the model exists: an overload,
+			// not a 404, and nothing will recover.
+			acc, err := db.Add("jwt.a", "a")
+			if err != nil {
+				t.Fatalf("add account: %v", err)
+			}
+			if err := db.UpdateQuota(acc.ID, store.Quota{
+				Remaining: 10, Limit: 10,
+				Entitlements: []map[string]any{{"name": "GLM-5.3", "limit": 10, "remaining": 10}},
+			}); err != nil {
+				t.Fatalf("set quota: %v", err)
+			}
+			db.SetStatusByID(acc.ID, "expired")
+
+			origin := &fakeOrigin{reply: func(int) (*http.Response, error) {
+				t.Error("the Origin must not be called for an expired Account")
+				return nil, errors.New("unreachable")
+			}}
+			srv := &Server{
+				store: db, catalog: NewCatalog(nil), origin: origin,
+				stickyAcc: map[string]int64{}, quota1005: map[string]int{}, chatOK: map[int64]time.Time{},
+				cfg: config.Config{RequestHold: 10 * time.Minute, AccountMaxTry: 1},
+			}
+			req := httptest.NewRequest(http.MethodPost, c.path,
+				strings.NewReader(`{"model":"GLM-5.3","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`))
+			rec := httptest.NewRecorder()
+
+			c.handle(srv, rec, req)
+
+			if rec.Code != 529 {
+				t.Fatalf("status = %d, want 529 (body=%s)", rec.Code, rec.Body.String())
+			}
+			if _, present := rec.Header()["Retry-After"]; present {
+				t.Errorf("Retry-After = %q, want the header absent — there is no figure", rec.Header().Get("Retry-After"))
+			}
+		})
 	}
 }
 
