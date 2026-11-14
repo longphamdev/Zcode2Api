@@ -12,7 +12,6 @@ import (
 	"strings"
 	"time"
 	"zcode2api/internal/captcha"
-	"zcode2api/internal/config"
 	"zcode2api/internal/store"
 	"zcode2api/internal/upstream"
 )
@@ -317,14 +316,16 @@ func (s *Server) injectDefaults(body []byte) []byte {
 	if err != nil {
 		return body
 	}
-	dm := config.DefaultModelID
+	// No default model is injected. A request without `model` is a client bug,
+	// and answering it with the server's preferred model hides that: the caller
+	// believes it asked for something it did not, and llm-comply's
+	// chat-error-handling test (plus the OpenAI spec) expects 400 for it.
+	// Callers decode the error at the route, where `model is required` is
+	// already the branch taken when ParseModel comes back empty.
 	m, _ := obj.Get("model")
 	ms, _ := m.(string)
-	if strings.TrimSpace(ms) == "" && dm != "" {
-		ms = dm
-	}
 	// the origin receives the canonical billing casing; any client casing resolves
-	if ms != "" {
+	if strings.TrimSpace(ms) != "" {
 		obj.Set("model", s.catalog.Resolve(ms))
 	}
 	// upstream legal max is 131072 — bigger budgets get 400 code 1210
