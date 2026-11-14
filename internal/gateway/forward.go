@@ -33,7 +33,17 @@ func (s *Server) routeAnthropic(w http.ResponseWriter, r *http.Request, body []b
 	body = s.injectDefaults(body)
 	model := upstream.ParseModel(body)
 	if model == "" {
-		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "model is required")
+		// The envelope has to match the route the client called: an OpenAI
+		// caller parses error.error.code and error.error.param (both required
+		// by the bundled spec), an Anthropic caller parses error.type/message.
+		// Answering either side in the other's shape is a 400 the client cannot
+		// read.
+		if openai {
+			param := "model"
+			writeOpenAIErrorFull(w, http.StatusBadRequest, "you must provide a model parameter", &param, nil)
+		} else {
+			writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "model is required")
+		}
 		return
 	}
 	// client aliases (claude-* probes, lowercase glm-*) resolve to the real
